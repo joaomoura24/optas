@@ -68,8 +68,8 @@ class Planner:
                 f"obs_avoid_{i}", dist_sq, safe_dist_sq
             )
 
-        # Cost: final state
-        builder.add_equality_constraint("final_state", optas.sumsqr(goal - X[:, -1]))
+        # Constraint: final state
+        builder.add_equality_constraint("final_state", X[:, -1], goal)
 
         # Cost: minimize velocity
         w = 1e-6 / float(T)  # weight on cost term

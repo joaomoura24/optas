@@ -19,7 +19,7 @@ from .optimization import (
 )
 from .models import RobotModel
 from .spatialmath import ArrayType, CasADiArrayType
-from typing import Dict, Tuple, List, Union
+from typing import Dict, Tuple, List, Union, Optional
 
 ## Optimization problem types with quadratic cost.
 QP_COST = {
@@ -330,7 +330,7 @@ class CasADiSolver(Solver):
     ## Possible QP solvers.
     qp_solvers = {"cplex", "gurobi", "ooqp", "qpoases", "sqic", "nlp"}
 
-    def setup(self, solver_name: str, solver_options: Dict = {}):
+    def setup(self, solver_name: str, solver_options: Optional[Dict] = None):
         """! Setup the optimization solver.
 
         @param solver_name The name of the solver to be used.
@@ -373,6 +373,7 @@ class CasADiSolver(Solver):
             )
 
         # Check for discrete variables
+        solver_options = dict(solver_options or {})
         if self.opt.has_discrete_variables():
             solver_options["discrete"] = self.opt.decision_variables.discrete()
 
@@ -426,7 +427,7 @@ class CasADiSolver(Solver):
 class OSQPSolver(Solver):
     """OSQP solver interface."""
 
-    def setup(self, use_warm_start, settings={}):
+    def setup(self, use_warm_start, settings: Optional[Dict] = None):
         """! Setup solver.
 
         @param use_warm_start When true, the initial seed x0 is used as a warm start. Default is True.
@@ -435,9 +436,7 @@ class OSQPSolver(Solver):
         """
         assert self.opt_type in QP_COST, "OSQP cannot solve this type of problem"
         self.use_warm_start = use_warm_start
-        self._setup_input = settings
-        if self.opt_type in CONSTRAINED_OPT:
-            self._setup_input["u"] = np.inf * np.ones(self.opt.nk + self.opt.na)
+        self._settings = dict(settings or {})
         self._reset_parameters()
         return self
 
@@ -452,18 +451,20 @@ class OSQPSolver(Solver):
     def _reset_parameters(self) -> None:
         """! Internal method to reset parameters."""
         self._setup_input = {
+            **self._settings,
             "P": csc_matrix(2.0 * self.opt.P(self.p).toarray()),
             "q": self.opt.q(self.p).toarray().flatten(),
         }
         if self.opt_type in CONSTRAINED_OPT:
-            A = self.opt.A(self.p)
-            b = self.opt.b(self.p)
+            # M x + c >= 0 and A x + b = 0, i.e. l <= [M; A] x <= u
+            b = self.opt.b(self.p).toarray().flatten()
             self._setup_input["A"] = csc_matrix(
-                cs.vertcat(self.opt.M(self.p), A, -A).toarray()
+                cs.vertcat(self.opt.M(self.p), self.opt.A(self.p)).toarray()
             )
-            self._setup_input["l"] = (
-                cs.vertcat(-self.opt.c(self.p), -b, b).toarray().flatten()
+            self._setup_input["l"] = np.concatenate(
+                [-self.opt.c(self.p).toarray().flatten(), -b]
             )
+            self._setup_input["u"] = np.concatenate([np.full(self.opt.nk, np.inf), -b])
 
     def _solve(self) -> CasADiArrayType:
         """! Solve the optimization problem using OSQP.
@@ -513,7 +514,7 @@ class OSQPSolver(Solver):
 class CVXOPTSolver(Solver):
     """! CVXOPT solver interface."""
 
-    def setup(self, solver_settings: Dict = {}):
+    def setup(self, solver_settings: Optional[Dict] = None):
         """! Setup the cvxopt solver interface.
 
         @param solver_settings Settings passed to the CVXOPT solver.
@@ -522,7 +523,7 @@ class CVXOPTSolver(Solver):
         assert self.opt_type in QP_COST, "CVXOPT cannot solve this problem"
 
         ## Input to the solver
-        self._solver_input = solver_settings
+        self._solver_input = dict(solver_settings or {})
 
         self._reset_parameters()
         return self
