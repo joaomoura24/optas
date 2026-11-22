@@ -17,8 +17,10 @@ DM = cs.casadi.DM
 class SXContainer(collections.OrderedDict):
     """! Container for SX variables"""
 
-    ## Dict[str, bool]: labels for each item in dict, true means variables are discrete
-    is_discrete = {}
+    def __init__(self, *args, **kwargs):
+        ## Dict[str, bool]: labels for each item in dict, true means variables are discrete
+        self.is_discrete = {}
+        super().__init__(*args, **kwargs)
 
     def __add__(self, other):
         """! Add two SXContainer's.

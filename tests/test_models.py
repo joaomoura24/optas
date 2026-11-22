@@ -3,7 +3,6 @@ import pytest
 import optas
 import pathlib
 import numpy as np
-import pybullet as pb
 import scipy.linalg as linalg
 import urdf_parser_py.urdf as urdf
 from scipy.spatial.transform import Rotation as Rot
@@ -1033,23 +1032,11 @@ class TestRobotModel:
 class TestRnea:
     # Setup path to tester robot URDF
     cwd = pathlib.Path(__file__).parent.resolve()  # path to current working directory
-    urdf_filename = "tester_robot_revolute.urdf"
-    urdf_path = os.path.join(cwd, urdf_filename)
-    # print(cwd)
+    urdf_path = os.path.join(cwd, "tester_robot_revolute.urdf")
 
-    # Setup model (with no parameterized joints)
+    # Setup model (with no parameterized joints) and reference model
     model = optas.RobotModel(urdf_filename=urdf_path)
-
-    pb.connect(pb.DIRECT)
-
-    # pb.setAdditionalSearchPath(cwd)
-
-    gravz = -9.81
-    pb.setGravity(0, 0, gravz)
-    id = pb.loadURDF(
-        urdf_path,
-        basePosition=[0, 0, 0],
-    )
+    tester_robot_model = RobotModelTester(urdf_path)
 
     def test_calculate_inverse_dynamics_symbol(self):
         q = optas.SX.sym("q", self.model.ndof)
@@ -1058,20 +1045,14 @@ class TestRnea:
         tau1 = self.model.rnea(q, qd, qdd)
         assert isinstance(tau1, optas.SX)
 
-    @pytest.mark.xfail(reason="known failure, pending fix", strict=False)
     def test_calculate_inverse_dynamics(self):
         for _ in range(NUM_RANDOM):
             q = self.model.get_random_joint_positions().toarray().flatten()
             qd = self.model.get_random_joint_positions().toarray().flatten()
             qdd = self.model.get_random_joint_positions().toarray().flatten()
             tau1 = self.model.rnea(q, qd, qdd)
-
-            tau2 = np.array(
-                pb.calculateInverseDynamics(
-                    self.id, q.tolist(), qd.tolist(), qdd.tolist()
-                )
-            )
-            assert isclose(tau1.toarray().flatten(), tau2, atol=8.0e-2)
+            tau2 = self.tester_robot_model.rne(q, qd, qdd)
+            assert isclose(tau1.toarray().flatten(), tau2)
 
 
 class TestDualArm:

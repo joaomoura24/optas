@@ -1,4 +1,3 @@
-import pytest
 import optas
 import numpy as np
 
@@ -53,7 +52,6 @@ class TestSolverInterface(_SolverTester):
         assert isclose(result["y"].toarray().flatten(), 3.0), name + " solver failed"
         assert solver.did_solve(), f"did_solve returns false for {name}"
 
-    @pytest.mark.xfail(reason="known failure, pending fix", strict=False)
     def test_casadi_interface(self):
         qp_solver_names = ["qpoases"]
         nlp_solver_names = ["ipopt", "sqpmethod"]
@@ -62,19 +60,16 @@ class TestSolverInterface(_SolverTester):
             solver = optas.CasADiSolver(opt).setup(solver_name)
             self.solve_and_check_solution(solver)
 
-    @pytest.mark.xfail(reason="known failure, pending fix", strict=False)
     def test_osqp_interface(self):
         opt = self.setup_optimization(True)  # OSQP fails for unconstrained
         solver = optas.OSQPSolver(opt).setup(True)
         self.solve_and_check_solution(solver)
 
-    @pytest.mark.xfail(reason="known failure, pending fix", strict=False)
     def test_cvxopt_interface(self):
         opt = self.setup_optimization()
         solver = optas.CVXOPTSolver(opt).setup()
         self.solve_and_check_solution(solver)
 
-    @pytest.mark.xfail(reason="known failure, pending fix", strict=False)
     def test_scipy_minimize_interface(self):
         solver_names = [
             "Nelder-Mead",

@@ -18,19 +18,14 @@ def test_setitem():
         a["xa"] = optas.SX.sym("xa")
 
 
-# ----------------------------------------------------------------------
-# Whilst discrete variables are support in the SXContainer,
-# mixed-integer programming (MIP) is not currently supported. I will
-# add tests for the methods commented once MIP is supported.
-# def test_variable_is_discrete():
-#     pass
-
-# def test_has_discrete_variables():
-#     pass
-
-# def test_discrete():
-#     pass
-# ----------------------------------------------------------------------
+def test_discrete():
+    a = SXContainer({"x": optas.SX.sym("x", 2), "y": optas.SX.sym("y")})
+    assert not a.has_discrete_variables()
+    a.variable_is_discrete("x")
+    assert a.has_discrete_variables()
+    assert a.discrete() == [True, True, False]
+    # discrete labels must not leak into other containers
+    assert not SXContainer({"z": optas.SX.sym("z")}).has_discrete_variables()
 
 
 def test_vec():
