@@ -1,27 +1,43 @@
 [build-system]
-requires = [
-  "setuptools==68.2.2; python_version>='3.8'",
-  "setuptools>=61.0; python_version<'3.8'"
-]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyoptas"
 version = "1.0.7"
-authors = [
-  { name="Christopher E. Mower", email="christopher.mower@kcl.ac.uk" },
-]
 description = "An optimization-based task specification library for task and motion planning (TAMP), trajectory optimization, and model predictive control."
 readme = "README.md"
-requires-python = ">=3.7"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Christopher E. Mower", email = "christopher.mower@kcl.ac.uk" }]
+maintainers = [{ name = "João Moura", email = "joao.moura@ed.ac.uk" }]
+requires-python = ">=3.12"
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+# Floors: first releases with Python 3.12 wheels, tested in a venv pinned to them
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11.2",
+  "casadi>=3.6.4",
+  "urdf-parser-py",
+  "pyyaml>=6.0.1",
 ]
 
+[project.optional-dependencies]
+vis = ["vtk>=9.3"]
+solvers = ["osqp>=0.6.5", "cvxopt>=1.3.2"]
+xacro = ["xacro"]
+all = ["pyoptas[vis,solvers,xacro]"]
+example = ["pyoptas[all]", "pybullet", "matplotlib"]
+test = ["pyoptas[all]", "roboticstoolbox-python", "pytest", "matplotlib"]
+
 [project.urls]
-"Homepage" = "https://cmower.github.io/optas/"
-"Documentation" = "https://cmower.github.io/optas/"
-"Bug Tracker" = "https://github.com/cmower/optas/issues"
-"Source" = "https://github.com/cmower/optas"
+Homepage = "https://github.com/joaomoura24/optas"
+Documentation = "https://joaomoura24.github.io/optas/"
+Issues = "https://github.com/joaomoura24/optas/issues"
+Source = "https://github.com/joaomoura24/optas"
+
+[tool.setuptools]
+packages = ["optas"]

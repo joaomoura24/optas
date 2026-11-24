@@ -3,13 +3,8 @@
 Several examples are contained in this directory.
 In addition, two experiments are also included.
 
-The majority of these examples require [PyBullet](https://pybullet.org/wordpress/).
-If you installed OpTaS without modifying `setup.py` this should have been installed by default.
-Otherwise, you can install PyBullet using `$ pip install pybullet`.
-
-Note, the OpTaS visualizer requires [VTK](https://vtk.org/).
-If you installed OpTaS without modifying `setup.py` this should have been installed by default.
-Otherwise, you can install VTK using `$ pip install vtk`.
+The majority of these examples require [PyBullet](https://pybullet.org/wordpress/), and some use the OpTaS visualizer, which requires [VTK](https://vtk.org/).
+Install everything the examples need with `$ pip install .[example]` from the repository root.
 
 ## Examples
 

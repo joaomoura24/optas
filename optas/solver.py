@@ -1,5 +1,3 @@
-import osqp
-import cvxopt
 import numpy as np
 import casadi as cs
 from dataclasses import dataclass
@@ -435,6 +433,9 @@ class OSQPSolver(Solver):
         @return The instance of the solve (i.e. self).
         """
         assert self.opt_type in QP_COST, "OSQP cannot solve this type of problem"
+        import osqp  # optional dependency: pip install 'pyoptas[solvers]'
+
+        self._osqp = osqp
         self.use_warm_start = use_warm_start
         self._settings = dict(settings or {})
         self._reset_parameters()
@@ -473,7 +474,7 @@ class OSQPSolver(Solver):
         """
 
         # Setup solver
-        self.m = osqp.OSQP()
+        self.m = self._osqp.OSQP()
         self.m.setup(**self._setup_input)
 
         # Warm start optimization
@@ -521,6 +522,9 @@ class CVXOPTSolver(Solver):
         @return The instance of the solve (i.e. self).
         """
         assert self.opt_type in QP_COST, "CVXOPT cannot solve this problem"
+        import cvxopt  # optional dependency: pip install 'pyoptas[solvers]'
+
+        self._cvxopt = cvxopt
 
         ## Input to the solver
         self._solver_input = dict(solver_settings or {})
@@ -538,6 +542,7 @@ class CVXOPTSolver(Solver):
 
     def _reset_parameters(self):
         """! Internal method to reset parameters."""
+        cvxopt = self._cvxopt
         self._solver_input["P"] = cvxopt.matrix(2.0 * self.opt.P(self.p).toarray())
         self._solver_input["q"] = cvxopt.matrix(self.opt.q(self.p).toarray().flatten())
         if self.opt_type in CONSTRAINED_OPT:
@@ -555,7 +560,7 @@ class CVXOPTSolver(Solver):
 
         @return The solution of the optimization problem.
         """
-        self._solution = cvxopt.solvers.qp(**self._solver_input)
+        self._solution = self._cvxopt.solvers.qp(**self._solver_input)
         return self._solution["x"]
 
     def stats(self):

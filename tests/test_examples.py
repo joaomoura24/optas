@@ -2,6 +2,7 @@ import os
 import sys
 import pathlib
 import importlib
+import pytest
 
 optas_path = pathlib.Path(
     __file__
@@ -9,6 +10,11 @@ optas_path = pathlib.Path(
 examples_path = optas_path / "example"
 
 sys.path.append(str(examples_path.absolute()))
+
+# Examples that simulate their plans in PyBullet, an optional dependency
+needs_pybullet = pytest.mark.skipif(
+    importlib.util.find_spec("pybullet") is None, reason="pybullet not installed"
+)
 
 
 def import_module(path):
@@ -29,6 +35,7 @@ def load_main_function(filename):
     return main
 
 
+@needs_pybullet
 def test_dual_arm():
     main = load_main_function("dual_arm.py")
     assert main(gui=False) == 0
@@ -44,11 +51,13 @@ def test_planar_ik():
     assert main() == 0
 
 
+@needs_pybullet
 def test_figure_eight_plan():
     main = load_main_function("figure_eight_plan.py")
     assert main(gui=False) == 0
 
 
+@needs_pybullet
 def test_figure_eight_plan_6dof():
     main = load_main_function("figure_eight_plan_6dof.py")
     assert main(gui=False) == 0
@@ -69,21 +78,19 @@ def test_point_mass_planner_mixedinteger():
     assert main(show=False) == 0
 
 
+@needs_pybullet
 def test_pushing():
     main = load_main_function("pushing.py")
     assert main(gui=False) == 0
 
 
-def test_pushing():
-    main = load_main_function("pushing.py")
-    assert main(gui=False) == 0
-
-
+@needs_pybullet
 def test_pybullet_api():
     main = load_main_function("pybullet_api.py")
     assert main(gui=False) == 0
 
 
+@needs_pybullet
 def test_simple_joint_space_planner():
     main = load_main_function("simple_joint_space_planner.py")
     assert main(gui=False) == 0

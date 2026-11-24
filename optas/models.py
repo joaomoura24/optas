@@ -9,9 +9,6 @@ import casadi as cs
 
 from typing import Callable, Union
 
-# https://wiki.ros.org/xacro
-import xacro
-
 # https://pypi.org/project/urdf-parser-py
 from urdf_parser_py.urdf import URDF, Joint, Link, Pose
 
@@ -264,6 +261,8 @@ class RobotModel(Model):
         ## Filename for xacro file.
         self.xacro_filename = xacro_filename
         if xacro_filename is not None:
+            import xacro  # optional dependency: pip install 'pyoptas[xacro]'
+
             try:
                 urdf_string = xacro.process(xacro_filename)
             except AttributeError:

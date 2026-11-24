@@ -148,10 +148,20 @@ $ python -m pip install 'pyoptas @ git+https://github.com/joaomoura24/optas.git'
 
 Note that `pip install pyoptas` installs the original upstream package from PyPI, not this version.
 
+The core install only needs CasADi, NumPy, SciPy, urdf-parser-py and PyYAML.
+Optional features are available as extras, e.g. `'pyoptas[vis,solvers] @ git+...'`:
+
+| Extra | Adds | Needed for |
+|---|---|---|
+| `vis` | vtk | `optas.Visualizer` |
+| `solvers` | osqp, cvxopt | `OSQPSolver`, `CVXOPTSolver` |
+| `xacro` | xacro | loading models from xacro files |
+| `all` | all of the above | |
+
 ## From source
 1. `$ git clone --recursive https://github.com/joaomoura24/optas.git` (if you do not want to build the documentation then the `--recursive` flag is not necessary)
 2. `$ cd optas`
-4. `$ pip install .`
+4. `$ pip install .` (or `$ pip install .[all]` for all optional features)
    - if you want to run the examples use: `$ pip install .[example]`
    - if you want to run the tests use: `$ pip install .[test]`
 
@@ -177,6 +187,8 @@ Note that `pip install pyoptas` installs the original upstream package from PyPI
    - `$ pytest tests/test_solver.py`
    - `$ pytest tests/test_spatialmath.py`
    - `$ pytest tests/test_sx_container.py`
+
+Example tests that simulate in PyBullet are skipped unless it is installed (`$ pip install pybullet`).
 
 # Known Issues
 
