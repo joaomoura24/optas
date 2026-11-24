@@ -31,7 +31,7 @@ solvers = ["osqp>=0.6.5", "cvxopt>=1.3.2"]
 xacro = ["xacro"]
 all = ["pyoptas[vis,solvers,xacro]"]
 example = ["pyoptas[all]", "pybullet", "matplotlib"]
-test = ["pyoptas[all]", "roboticstoolbox-python", "pybullet", "pytest", "matplotlib"]
+test = ["pyoptas[all]", "roboticstoolbox-python", "pytest", "matplotlib"]
 
 [project.urls]
 Homepage = "https://github.com/joaomoura24/optas"

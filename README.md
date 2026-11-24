@@ -188,6 +188,8 @@ Optional features are available as extras, e.g. `'pyoptas[vis,solvers] @ git+...
    - `$ pytest tests/test_spatialmath.py`
    - `$ pytest tests/test_sx_container.py`
 
+Example tests that simulate in PyBullet are skipped unless it is installed (`$ pip install pybullet`).
+
 # Known Issues
 
 - Loading robot models from xacro files is supported, however there can be issues if you are running this in a ROS agnositic environment. If you do not have ROS installed, then the xacro file should not contain ROS-specific features. For further details see [here](https://github.com/cmower/optas/issues/78).
