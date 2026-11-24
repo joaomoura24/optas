@@ -22,5 +22,5 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install .[test] xacro
+      - run: pip install .[test]
       - run: pytest tests
