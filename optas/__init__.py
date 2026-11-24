@@ -4,7 +4,15 @@ from .spatialmath import *
 from .models import RobotModel, TaskModel
 from .builder import OptimizationBuilder
 from .solver import CasADiSolver, OSQPSolver, CVXOPTSolver, ScipyMinimizeSolver
-from .visualize import Visualizer
+
+
+def __getattr__(name):
+    # Import the visualizer (and vtk) only when it is first used
+    if name == "Visualizer":
+        from .visualize import Visualizer
+
+        return Visualizer
+    raise AttributeError(f"module 'optas' has no attribute '{name}'")
 
 
 @arrayify_args

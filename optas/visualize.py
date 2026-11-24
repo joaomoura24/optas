@@ -2,7 +2,10 @@
 
 import os
 
-import vtk
+try:
+    import vtk
+except ImportError as e:
+    raise ImportError("Visualizer requires vtk: pip install 'pyoptas[vis]'") from e
 from vtkmodules.vtkFiltersSources import (
     vtkCylinderSource,
     vtkSphereSource,
