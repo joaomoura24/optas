@@ -842,25 +842,43 @@ class TestRobotModel:
                 J_expc = tester_robot_model.jacob0_analytical(qi)[3:, :][::-1, :]
                 assert isclose(J_test, J_expc)
 
-    def test_get_link_axis(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_link_axis("eff", q, "x", self.model.get_root_link())
-        assert isinstance(axis, optas.SX)
+    # Axis given by name, or as an (unnormalized) vector in the link frame
+    axes = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1], "vector": [1, 2, 3]}
 
-    def test_get_link_axis_function(self):
+    def _check_axis(self, name, base, get, get_function):
+        axis = name if name != "vector" else optas.DM(self.axes[name])
+        a = np.array(self.axes[name]) / np.linalg.norm(self.axes[name])
+        expected = lambda q: expected_link_transform(q, self.rel_link, base)[:3, :3] @ a
+        for _ in range(NUM_RANDOM // 10):
+            n = np.random.randint(2, 10)
+            q = self.model.get_random_joint_positions(n=n).toarray()
+            out = get_function(axis, n)(q).toarray()
+            for i in range(n):
+                v = get(q[:, i], axis).toarray().flatten()
+                assert isclose(v, expected(q[:, i]))
+                assert isclose(out[:, i], expected(q[:, i]))
         q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_link_axis_function("eff", "x", self.model.get_root_link())
-        assert isinstance(axis(q), optas.SX)
+        assert isinstance(get(q, axis), optas.SX)
 
-    def test_get_global_link_axis(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_global_link_axis("eff", q, "x")
-        assert isinstance(axis, optas.SX)
+    @pytest.mark.parametrize("name", axes)
+    def test_get_link_axis(self, name):
+        link, base = self.rel_link, self.rel_base
+        self._check_axis(
+            name,
+            base,
+            lambda q, axis: self.model.get_link_axis(link, q, axis, base),
+            lambda axis, n: self.model.get_link_axis_function(link, axis, base, n=n),
+        )
 
-    def test_get_global_link_axis_function(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_global_link_axis_function("eff", "x")
-        assert isinstance(axis(q), optas.SX)
+    @pytest.mark.parametrize("name", axes)
+    def test_get_global_link_axis(self, name):
+        link = self.rel_link
+        self._check_axis(
+            name,
+            self.model.get_root_link(),
+            lambda q, axis: self.model.get_global_link_axis(link, q, axis),
+            lambda axis, n: self.model.get_global_link_axis_function(link, axis, n=n),
+        )
 
 
 class TestRnea:
