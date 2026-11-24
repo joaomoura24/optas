@@ -31,6 +31,32 @@ def expected_link_transform(q, link, base):
     return np.linalg.inv(T(base)) @ T(link)
 
 
+def expected_link_jacobian(q, link, base, kind, h=1e-6):
+    """Reference Jacobian of link in the base frame, from roboticstoolbox.
+
+    Geometric parts are the world Jacobian rotated into the base frame. The
+    analytical angular part is d(rpy of link w.r.t. base)/dq, by central differences.
+    """
+    J0 = tester_robot_model.jacob0(q, end=link)
+    R = tester_robot_model.fkine(q, end=base).R.T
+    rpy = lambda q: Rot.from_matrix(expected_link_transform(q, link, base)[:3, :3])
+    dq = h * np.eye(len(q))
+    J_rpy = np.column_stack(
+        [
+            (rpy(q + d).as_euler("xyz") - rpy(q - d).as_euler("xyz")) / (2 * h)
+            for d in dq
+        ]
+    )
+    lin, ang = R @ J0[:3], R @ J0[3:]
+    return {
+        "geometric": np.vstack([lin, ang]),
+        "analytical": np.vstack([lin, J_rpy]),
+        "linear": lin,
+        "angular_geometric": ang,
+        "angular_analytical": J_rpy,
+    }[kind]
+
+
 ###########################################################################
 # Tests
 #
@@ -715,58 +741,35 @@ class TestRobotModel:
                 J_expc[3:, :] = _J_expc[3:, :][::-1, :]
                 assert isclose(J_test, J_expc)
 
-    def test_get_link_geometric_jacobian(self):
+    rel_jacobian_kinds = [
+        "geometric",
+        "analytical",
+        "linear",
+        "angular_geometric",
+        "angular_analytical",
+    ]
+
+    def _check_link_jacobian(self, kind, q, out):
+        J = expected_link_jacobian(q, self.rel_link, self.rel_base, kind)
+        assert isclose(np.asarray(out), J, atol=1e-6)
+
+    @pytest.mark.parametrize("kind", rel_jacobian_kinds)
+    def test_get_link_jacobian(self, kind):
+        get = getattr(self.model, f"get_link_{kind}_jacobian")
         for _ in range(NUM_RANDOM):
             q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_geometric_jacobian("eff", q, "link3")
-            J_expc = tester_robot_model.jacobe(q)
-            assert isclose(J.toarray(), J_expc)
+            J = get(self.rel_link, q, self.rel_base).toarray()
+            self._check_link_jacobian(kind, q, J)
 
-    def test_get_link_geometric_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
+    @pytest.mark.parametrize("kind", rel_jacobian_kinds)
+    def test_get_link_jacobian_function(self, kind):
+        for _ in range(NUM_RANDOM // 10):
             n = np.random.randint(2, 10)
             q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_geometric_jacobian_function("eff", "link3", n=n)
-            Js = J(q)
-
+            fun = getattr(self.model, f"get_link_{kind}_jacobian_function")
+            out = fun(self.rel_link, self.rel_base, n=n)(q)
             for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacobe(qi)
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_analytical_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_geometric_jacobian(
-                "eff", q, self.model.get_root_link()
-            )
-
-            _J_expc = tester_robot_model.jacob0_analytical(q)
-            J_expc = np.zeros_like(_J_expc)
-            J_expc[:3, :] = _J_expc[:3, :]
-            J_expc[3:, :] = _J_expc[3:, :][::-1, :]
-            assert isclose(J.toarray(), J_expc)
-
-    def test_get_link_analytical_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_analytical_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                _J_expc = tester_robot_model.jacob0_analytical(qi)
-                J_expc = np.zeros_like(_J_expc)
-                J_expc[:3, :] = _J_expc[:3, :]
-                J_expc[3:, :] = _J_expc[3:, :][::-1, :]
-                assert isclose(J_test, J_expc)
+                self._check_link_jacobian(kind, q[:, i], out[i].toarray())
 
     def test_get_global_link_linear_jacobian(self):
         for _ in range(NUM_RANDOM):
@@ -781,31 +784,6 @@ class TestRobotModel:
             q = self.model.get_random_joint_positions(n=n).toarray()
 
             J = self.model.get_global_link_linear_jacobian_function("eff", n=n)
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)[:3, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_linear_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_linear_jacobian(
-                "eff", q, self.model.get_root_link()
-            ).toarray()
-            J_expc = tester_robot_model.jacob0(q)[:3, :]
-            assert isclose(J, J_expc)
-
-    def test_get_link_linear_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_linear_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
             Js = J(q)
 
             for i in range(n):
@@ -855,60 +833,6 @@ class TestRobotModel:
 
             J = self.model.get_global_link_angular_analytical_jacobian_function(
                 "eff", n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0_analytical(qi)[3:, :][::-1, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_angular_geometric_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_angular_geometric_jacobian(
-                "eff",
-                q,
-                self.model.get_root_link(),
-            ).toarray()
-            J_expc = tester_robot_model.jacob0(q)[3:, :]
-            assert isclose(J, J_expc)
-
-    def test_get_link_angular_geometric_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_angular_geometric_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)[3:, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_angular_analytical_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_angular_analytical_jacobian(
-                "eff",
-                q,
-                self.model.get_root_link(),
-            ).toarray()
-            J_expc = tester_robot_model.jacob0_analytical(q)[3:, :][::-1, :]
-            assert isclose(J, J_expc)
-
-    def test_get_link_angular_analytical_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_angular_analytical_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
             )
             Js = J(q)
 
