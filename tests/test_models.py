@@ -10,7 +10,8 @@ from .tester_robot_model import RobotModelTester
 
 NUM_RANDOM = 100
 
-tester_robot_model = RobotModelTester()
+TESTS_PATH = pathlib.Path(__file__).parent.resolve()
+EXAMPLE_PATH = TESTS_PATH.parent / "example"
 
 ###########################################################################
 # Helper methods
@@ -23,6 +24,11 @@ def random_vector(lo=-1, hi=1, n=3):
 
 def isclose(A: np.ndarray, B: np.ndarray, atol=1e-08):
     return np.isclose(A, B, atol=atol).all()
+
+
+def wrap(a):
+    """Wrap angles to [-pi, pi): pi and -pi are the same angle."""
+    return (a + np.pi) % (2 * np.pi) - np.pi
 
 
 ###########################################################################
@@ -463,32 +469,6 @@ class TestRobotModel:
                 T = self.model.get_random_pose_in_global_link(link_name)
                 assert np.linalg.norm(T[:3, 3].toarray().flatten()) <= max_radius
 
-    def test_get_global_link_transform(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            expected_fkine = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-            for link_name, expected_T in zip(self.model.link_names, expected_fkine[1:]):
-                T = self.model.get_global_link_transform(link_name, q).toarray()
-                assert isclose(T, expected_T)
-
-    def test_get_global_link_transform_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            for link_idx, link_name in enumerate(self.model.link_names):
-                Tr = self.model.get_global_link_transform_function(link_name, n=n)
-                Trs = Tr(q)
-
-                for i in range(n):
-                    qi = q[:, i].flatten()
-                    expected_fkine = [
-                        np.array(fk) for fk in tester_robot_model.fkine_all(qi)
-                    ]
-                    T_test = Trs[i].toarray()
-                    T_expc = expected_fkine[link_idx + 1]
-                    assert isclose(T_test, T_expc)
-
     def test_get_global_link_transform_function_numpy_output(self):
         link_name = self.model.link_names[-1]
         q = self.model.get_random_joint_positions().toarray()
@@ -500,533 +480,144 @@ class TestRobotModel:
         with pytest.raises(AssertionError):
             T = Tr(q)
 
-    def test_get_link_transform(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-            T_expc = np.linalg.inv(T_W[-2]) @ T_W[-1]
-            T = self.model.get_link_transform("eff", q, "link3")
-            assert isclose(T.toarray(), T_expc)
 
-    def test_get_link_transform_non_adjacent_base(self):
-        # eff relative to link3 is a constant z-offset that commutes with the
-        # z-axis joints, so it cannot distinguish inv(T_B) @ T_L from
-        # T_L @ inv(T_B). Use link1 as base, where the two differ.
-        idx_eff, idx_base = -1, 2  # fkine_all: [base, world, link1, link2, link3, eff]
-        n = 5
-        q = self.model.get_random_joint_positions(n=n).toarray()
-        Tr = self.model.get_link_transform_function("eff", "link1", n=n)
-        pr = self.model.get_link_position_function("eff", "link1", n=n)
-        Rr = self.model.get_link_rotation_function("eff", "link1", n=n)
-        Trs, prs, Rrs = Tr(q), pr(q), Rr(q)
-        for i in range(n):
-            qi = q[:, i].flatten()
-            T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(qi)]
-            T_expc = np.linalg.inv(T_W[idx_base]) @ T_W[idx_eff]
-            assert isclose(
-                self.model.get_link_transform("eff", qi, "link1").toarray(), T_expc
+class Robot:
+    """Model under test, its roboticstoolbox reference, and a link/base pair for
+    relative checks. The base must not be adjacent to the link: a constant offset
+    can't tell inv(T_B) @ T_L apart from other compositions of the two transforms."""
+
+    def __init__(self, urdf_path, rel_link, rel_base, num):
+        self.model = optas.RobotModel(urdf_filename=str(urdf_path))
+        self.ref = RobotModelTester(str(urdf_path))
+        self.root = self.model.get_root_link()
+        self.rel_link, self.rel_base, self.num = rel_link, rel_base, num
+
+    def transform(self, q, link, base):
+        """Reference transform of link in the base frame."""
+        T = lambda name: self.ref.fkine(q, end=name).A
+        return np.linalg.inv(T(base)) @ T(link)
+
+    def jacobian(self, q, link, base, kind, h=1e-6):
+        """Reference Jacobian of link in the base frame.
+
+        Geometric parts are the world Jacobian rotated into the base frame. The
+        analytical angular part is d(rpy of link w.r.t. base)/dq, by central differences.
+        """
+        J0 = self.ref.jacob0(q, end=link)
+        J0 = np.pad(J0, ((0, 0), (0, len(q) - J0.shape[1])))  # joints after link
+        R = self.ref.fkine(q, end=base).R.T
+        rpy = lambda q: Rot.from_matrix(self.transform(q, link, base)[:3, :3]).as_euler(
+            "xyz"
+        )
+        # Divide by the step actually taken: q + h is inexact for large q (joint0)
+        steps = [(q + d, q - d) for d in h * np.eye(len(q))]
+        J_rpy = np.column_stack(
+            [wrap(rpy(a) - rpy(b)) / (a - b)[i] for i, (a, b) in enumerate(steps)]
+        )
+        lin, ang = R @ J0[:3], R @ J0[3:]
+        return {
+            "geometric": np.vstack([lin, ang]),
+            "analytical": np.vstack([lin, J_rpy]),
+            "linear": lin,
+            "angular_geometric": ang,
+            "angular_analytical": J_rpy,
+        }[kind]
+
+
+# The planar tester robot, and the KUKA LWR whose mixed joint axes catch
+# rotation-order and axis mix-ups that a planar robot can't
+ROBOTS = {
+    "tester": Robot(TESTS_PATH / "tester_robot.urdf", "eff", "link1", NUM_RANDOM),
+    "kuka_lwr": Robot(
+        EXAMPLE_PATH / "robots" / "kuka_lwr" / "kuka_lwr.urdf",
+        "end_effector",
+        "lwr_arm_2_link",
+        NUM_RANDOM // 5,
+    ),
+}
+
+POSES = {
+    "transform": lambda T: T,
+    "position": lambda T: T[:3, 3],
+    "rotation": lambda T: T[:3, :3],
+    "quaternion": lambda T: Rot.from_matrix(T[:3, :3]).as_quat(),
+    "rpy": lambda T: Rot.from_matrix(T[:3, :3]).as_euler("xyz"),
+}
+JACOBIANS = [
+    "geometric",
+    "analytical",
+    "linear",
+    "angular_geometric",
+    "angular_analytical",
+]
+# Axis given by name, or as an (unnormalized) vector in the link frame
+AXES = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1], "vector": [1, 2, 3]}
+
+
+@pytest.mark.parametrize("frame", ["global", "relative"])
+@pytest.mark.parametrize("robot", ROBOTS.values(), ids=ROBOTS.keys())
+class TestKinematics:
+    """Compare get_global_link_<name> (every link, root base) and get_link_<name>
+    (the robot's link/base pair), and their _function versions, with roboticstoolbox."""
+
+    def _check(self, robot, frame, name, expected, *args):
+        model = robot.model
+        if frame == "global":
+            pairs = [(link, robot.root) for link in model.link_names]
+            get = lambda link, base, q: getattr(model, f"get_global_link_{name}")(
+                link, q, *args
             )
-            assert isclose(Trs[i].toarray(), T_expc)
-            assert isclose(prs[:, i].toarray().flatten(), T_expc[:3, 3])
-            assert isclose(Rrs[i].toarray(), T_expc[:3, :3])
+            fun = lambda link, base, n: getattr(
+                model, f"get_global_link_{name}_function"
+            )(link, *args, n=n)
+        else:
+            pairs = [(robot.rel_link, robot.rel_base)]
+            get = lambda link, base, q: getattr(model, f"get_link_{name}")(
+                link, q, *args, base
+            )
+            fun = lambda link, base, n: getattr(model, f"get_link_{name}_function")(
+                link, *args, base, n=n
+            )
 
-    def test_get_link_transform_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
+        def assert_close(out, exp):
+            out, exp = np.asarray(out).flatten(), np.asarray(exp).flatten()
+            if name == "rpy":  # e.g. a roll of pi or -pi
+                out = exp + wrap(out - exp)
+            # q and -q are the same quaternion
+            assert isclose(out, exp, 1e-6) or (
+                name == "quaternion" and isclose(out, -exp, 1e-6)
+            )
 
-            Tr = self.model.get_link_transform_function("eff", "link3", n=n)
-            Trs = Tr(q)
-
-            for i in range(n):
-                T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-                T_expc = np.linalg.inv(T_W[-2]) @ T_W[-1]
-                T = Trs[i].toarray()
-                assert isclose(T, T_expc)
-
-    def test_get_global_link_position(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            expected_fkine = [
-                np.array(fk)[:3, 3].flatten() for fk in tester_robot_model.fkine_all(q)
-            ]
-            for link_name, expected_T in zip(self.model.link_names, expected_fkine[1:]):
-                T = (
-                    self.model.get_global_link_position(link_name, q)
-                    .toarray()
-                    .flatten()
-                )
-                assert isclose(T, expected_T)
-
-    def test_get_global_link_position_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            for link_idx, link_name in enumerate(self.model.link_names):
-                Tr = self.model.get_global_link_position_function(link_name, n=n)
-                Trs = Tr(q)
-
+        for link, base in pairs:
+            for _ in range(robot.num // 10):
+                n = np.random.randint(2, 10)
+                q = model.get_random_joint_positions(n=n).toarray()
+                out = fun(link, base, n)(q)
                 for i in range(n):
-                    qi = q[:, i].flatten()
-                    expected_fkine = [
-                        np.array(fk)[:3, 3].flatten()
-                        for fk in tester_robot_model.fkine_all(qi)
-                    ]
-                    T_test = Trs[:, i].toarray().flatten()
-                    T_expc = expected_fkine[link_idx + 1]
-                    assert isclose(T_test, T_expc)
-
-    def test_get_link_position(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-            T_expc = (np.linalg.inv(T_W[-2]) @ T_W[-1])[:3, 3].flatten()
-            T = self.model.get_link_position("eff", q, "link3")
-            assert isclose(T.toarray().flatten(), T_expc)
-
-    def test_get_link_position_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            Tr = self.model.get_link_position_function("eff", "link3", n=n)
-            Trs = Tr(q)
-
-            for i in range(n):
-                T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-                T_expc = (np.linalg.inv(T_W[-2]) @ T_W[-1])[:3, 3].flatten()
-                T = Trs[:, i].toarray().flatten()
-                assert isclose(T, T_expc)
-
-    def test_get_global_link_rotation(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            expected_fkine = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-            for link_name, expected_T in zip(self.model.link_names, expected_fkine[1:]):
-                T = self.model.get_global_link_rotation(link_name, q).toarray()
-                assert isclose(T, expected_T[:3, :3])
-
-    def test_get_global_link_rotation_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            for link_idx, link_name in enumerate(self.model.link_names):
-                Tr = self.model.get_global_link_rotation_function(link_name, n=n)
-                Trs = Tr(q)
-
-                for i in range(n):
-                    qi = q[:, i].flatten()
-                    expected_fkine = [
-                        np.array(fk) for fk in tester_robot_model.fkine_all(qi)
-                    ]
-                    T_test = Trs[i].toarray()
-                    T_expc = expected_fkine[link_idx + 1]
-                    assert isclose(T_test, T_expc[:3, :3])
-
-    def test_get_link_rotation(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-            T_expc = np.linalg.inv(T_W[-2]) @ T_W[-1]
-            T = self.model.get_link_rotation("eff", q, "link3")
-            assert isclose(T.toarray(), T_expc[:3, :3])
-
-    def test_get_link_rotation_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            Tr = self.model.get_link_rotation_function("eff", "link3", n=n)
-            Trs = Tr(q)
-
-            for i in range(n):
-                T_W = [np.array(fk) for fk in tester_robot_model.fkine_all(q)]
-                T_expc = np.linalg.inv(T_W[-2]) @ T_W[-1]
-                T = Trs[i].toarray()
-                assert isclose(T, T_expc[:3, :3])
-
-    def test_get_global_link_quaternion(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            expected_fkine = [
-                Rot.from_matrix(fk.R).as_quat()
-                for fk in tester_robot_model.fkine_all(q)
-            ]
-            for link_name, expected_T in zip(self.model.link_names, expected_fkine[1:]):
-                T = (
-                    self.model.get_global_link_quaternion(link_name, q)
-                    .toarray()
-                    .flatten()
-                )
-                assert isclose(T, expected_T) or isclose(T, -expected_T)
-
-    def test_get_global_link_quaternion_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            for link_idx, link_name in enumerate(self.model.link_names):
-                Tr = self.model.get_global_link_quaternion_function(link_name, n=n)
-                Trs = Tr(q)
-
-                for i in range(n):
-                    qi = q[:, i].flatten()
-                    expected_fkine = [
-                        Rot.from_matrix(fk.R).as_quat()
-                        for fk in tester_robot_model.fkine_all(qi)
-                    ]
-                    T_test = Trs[:, i].toarray().flatten()
-                    T_expc = expected_fkine[link_idx + 1]
-                    assert isclose(T_test, T_expc) or isclose(T_test, -T_expc)
-
-    def test_get_link_quaternion(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            T_W = [Rot.from_matrix(fk.R) for fk in tester_robot_model.fkine_all(q)]
-            T_expc = (T_W[-1].inv() * T_W[-1]).as_quat()
-            T = self.model.get_link_quaternion("eff", q, "link3")
-            assert isclose(T.toarray().flatten(), T_expc) or isclose(
-                T.toarray().flatten(), -T_expc
-            )
-
-    def test_get_link_quaternion_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            Tr = self.model.get_link_quaternion_function("eff", "link3", n=n)
-            Trs = Tr(q)
-
-            for i in range(n):
-                T_W = [Rot.from_matrix(fk.R) for fk in tester_robot_model.fkine_all(q)]
-                T_expc = (T_W[-1].inv() * T_W[-1]).as_quat()
-                T = Trs[:, i].toarray().flatten()
-                assert isclose(T, T_expc) or isclose(T, -T_expc)
-
-    def test_get_global_link_rpy(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            expected_fkine = [
-                Rot.from_matrix(fk.R).as_euler("xyz")
-                for fk in tester_robot_model.fkine_all(q)
-            ]
-            for link_name, expected_T in zip(self.model.link_names, expected_fkine[1:]):
-                T = self.model.get_global_link_rpy(link_name, q).toarray().flatten()
-                assert isclose(T, expected_T)
-
-    def test_get_global_link_rpy_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            for link_idx, link_name in enumerate(self.model.link_names):
-                Tr = self.model.get_global_link_rpy_function(link_name, n=n)
-                Trs = Tr(q)
-
-                for i in range(n):
-                    qi = q[:, i].flatten()
-                    expected_fkine = [
-                        Rot.from_matrix(fk.R).as_euler("xyz")
-                        for fk in tester_robot_model.fkine_all(qi)
-                    ]
-                    T_test = Trs[:, i].toarray().flatten()
-                    T_expc = expected_fkine[link_idx + 1]
-                    assert isclose(T_test, T_expc)
-
-    def test_get_link_rpy(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            T_W = [Rot.from_matrix(fk.R) for fk in tester_robot_model.fkine_all(q)]
-            T_expc = (T_W[-2].inv() * T_W[-1]).as_euler("xyz")
-            T = self.model.get_link_rpy("eff", q, "link3")
-            assert isclose(T.toarray().flatten(), T_expc)
-
-    def test_get_link_rpy_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            Tr = self.model.get_link_rpy_function("eff", "link3", n=n)
-            Trs = Tr(q)
-
-            for i in range(n):
-                T_W = [Rot.from_matrix(fk.R) for fk in tester_robot_model.fkine_all(q)]
-                T_expc = (T_W[-2].inv() * T_W[-1]).as_euler("xyz")
-                T = Trs[:, i].toarray().flatten()
-                assert isclose(T, T_expc)
-
-    def test_get_global_link_geometric_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_global_link_geometric_jacobian("eff", q)
-            J_expc = tester_robot_model.jacob0(q)
-            assert isclose(J.toarray(), J_expc)
-
-    def test_get_global_link_geometric_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_global_link_geometric_jacobian_function("eff", n=n)
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)
-                assert isclose(J_test, J_expc)
-
-    def test_get_global_link_analytical_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_global_link_analytical_jacobian("eff", q)
-            _J_expc = tester_robot_model.jacob0_analytical(q)
-            J_expc = np.zeros_like(_J_expc)
-            J_expc[:3, :] = _J_expc[:3, :]
-            J_expc[3:, :] = _J_expc[3:, :][::-1, :]
-            assert isclose(J.toarray(), J_expc)
-
-    def test_get_global_link_analytical_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_global_link_analytical_jacobian_function("eff", n=n)
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                _J_expc = tester_robot_model.jacob0_analytical(qi)
-                J_expc = np.zeros_like(_J_expc)
-                J_expc[:3, :] = _J_expc[:3, :]
-                J_expc[3:, :] = _J_expc[3:, :][::-1, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_geometric_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_geometric_jacobian("eff", q, "link3")
-            J_expc = tester_robot_model.jacobe(q)
-            assert isclose(J.toarray(), J_expc)
-
-    def test_get_link_geometric_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_geometric_jacobian_function("eff", "link3", n=n)
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacobe(qi)
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_analytical_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_geometric_jacobian(
-                "eff", q, self.model.get_root_link()
-            )
-
-            _J_expc = tester_robot_model.jacob0_analytical(q)
-            J_expc = np.zeros_like(_J_expc)
-            J_expc[:3, :] = _J_expc[:3, :]
-            J_expc[3:, :] = _J_expc[3:, :][::-1, :]
-            assert isclose(J.toarray(), J_expc)
-
-    def test_get_link_analytical_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_analytical_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                _J_expc = tester_robot_model.jacob0_analytical(qi)
-                J_expc = np.zeros_like(_J_expc)
-                J_expc[:3, :] = _J_expc[:3, :]
-                J_expc[3:, :] = _J_expc[3:, :][::-1, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_global_link_linear_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_global_link_linear_jacobian("eff", q).toarray()
-            J_expc = tester_robot_model.jacob0(q)[:3, :]
-            assert isclose(J, J_expc)
-
-    def test_get_global_link_linear_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_global_link_linear_jacobian_function("eff", n=n)
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)[:3, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_linear_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_linear_jacobian(
-                "eff", q, self.model.get_root_link()
-            ).toarray()
-            J_expc = tester_robot_model.jacob0(q)[:3, :]
-            assert isclose(J, J_expc)
-
-    def test_get_link_linear_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_linear_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)[:3, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_global_link_angular_geometric_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_global_link_angular_geometric_jacobian(
-                "eff", q
-            ).toarray()
-            J_expc = tester_robot_model.jacob0(q)[3:, :]
-            assert isclose(J, J_expc)
-
-    def test_get_global_link_angular_geometric_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_global_link_angular_geometric_jacobian_function(
-                "eff", n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)[3:, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_global_link_angular_analytical_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_global_link_angular_analytical_jacobian(
-                "eff", q
-            ).toarray()
-            J_expc = tester_robot_model.jacob0_analytical(q)[3:, :][::-1, :]
-            assert isclose(J, J_expc)
-
-    def test_get_global_link_angular_analytical_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_global_link_angular_analytical_jacobian_function(
-                "eff", n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0_analytical(qi)[3:, :][::-1, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_angular_geometric_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_angular_geometric_jacobian(
-                "eff",
-                q,
-                self.model.get_root_link(),
-            ).toarray()
-            J_expc = tester_robot_model.jacob0(q)[3:, :]
-            assert isclose(J, J_expc)
-
-    def test_get_link_angular_geometric_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_angular_geometric_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0(qi)[3:, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_angular_analytical_jacobian(self):
-        for _ in range(NUM_RANDOM):
-            q = self.model.get_random_joint_positions().toarray().flatten()
-            J = self.model.get_link_angular_analytical_jacobian(
-                "eff",
-                q,
-                self.model.get_root_link(),
-            ).toarray()
-            J_expc = tester_robot_model.jacob0_analytical(q)[3:, :][::-1, :]
-            assert isclose(J, J_expc)
-
-    def test_get_link_angular_analytical_jacobian_function(self):
-        for _ in range(NUM_RANDOM):
-            n = np.random.randint(2, 10)
-            q = self.model.get_random_joint_positions(n=n).toarray()
-
-            J = self.model.get_link_angular_analytical_jacobian_function(
-                "eff", self.model.get_root_link(), n=n
-            )
-            Js = J(q)
-
-            for i in range(n):
-                qi = q[:, i].flatten()
-                J_test = Js[i].toarray()
-                J_expc = tester_robot_model.jacob0_analytical(qi)[3:, :][::-1, :]
-                assert isclose(J_test, J_expc)
-
-    def test_get_link_axis(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_link_axis("eff", q, "x", self.model.get_root_link())
-        assert isinstance(axis, optas.SX)
-
-    def test_get_link_axis_function(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_link_axis_function("eff", "x", self.model.get_root_link())
-        assert isinstance(axis(q), optas.SX)
-
-    def test_get_global_link_axis(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_global_link_axis("eff", q, "x")
-        assert isinstance(axis, optas.SX)
-
-    def test_get_global_link_axis_function(self):
-        q = optas.SX.sym("q", self.model.ndof)
-        axis = self.model.get_global_link_axis_function("eff", "x")
-        assert isinstance(axis(q), optas.SX)
+                    exp = expected(q[:, i], link, base)
+                    assert_close(get(link, base, q[:, i]).toarray(), exp)
+                    out_i = out[i] if isinstance(out, list) else out[:, i]
+                    assert_close(out_i.toarray(), exp)
+            if link != base:  # the root's pose is constant, returned as DM
+                q = optas.SX.sym("q", model.ndof)
+                assert isinstance(get(link, base, q), optas.SX)
+
+    @pytest.mark.parametrize("kind", POSES)
+    def test_pose(self, robot, frame, kind):
+        expected = lambda q, link, base: POSES[kind](robot.transform(q, link, base))
+        self._check(robot, frame, kind, expected)
+
+    @pytest.mark.parametrize("kind", JACOBIANS)
+    def test_jacobian(self, robot, frame, kind):
+        expected = lambda q, link, base: robot.jacobian(q, link, base, kind)
+        self._check(robot, frame, f"{kind}_jacobian", expected)
+
+    @pytest.mark.parametrize("axis", AXES)
+    def test_axis(self, robot, frame, axis):
+        a = np.array(AXES[axis]) / np.linalg.norm(AXES[axis])
+        expected = lambda q, link, base: robot.transform(q, link, base)[:3, :3] @ a
+        arg = axis if axis != "vector" else optas.DM(AXES[axis])
+        self._check(robot, frame, "axis", expected, arg)
 
 
 class TestRnea:
