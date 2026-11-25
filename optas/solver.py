@@ -380,16 +380,20 @@ class CasADiSolver(Solver):
 
         # Setup constraints
 
-        ## Lower bound on constraints.
-        self._lbg = None
-
-        ## Upper bound on constraints
-        self._ubg = None
-
+        # Constraints lbg(p) <= g(x, p) <= ubg(p): one row per equality or bound
+        self._bounds = None
+        self._bounds_p_index = np.zeros(0, dtype=int)  # entries of p the bounds use
         if self.opt_type in CONSTRAINED_OPT:
-            problem["g"] = cs.cse(self.opt.v(x, p))
-            self._lbg = self.opt.lbv
-            self._ubg = self.opt.ubv
+            problem["g"] = cs.cse(self.opt.con(x, p))
+            lbg, ubg = self.opt.lbcon(p), self.opt.ubcon(p)
+            self._bounds = cs.Function("bounds", [p], [lbg, ubg])
+            # Evaluated here, and again on reset_parameters when the entries of p they
+            # depend on change (e.g. joint limits given as parameters rarely do)
+            self._lbg, self._ubg = self._bounds(self._p)
+            if self.opt.np > 0:
+                used = cs.which_depends(cs.vertcat(lbg, ubg), p, 1, False)
+                self._bounds_p_index = np.flatnonzero(used)
+            self._bounds_p = self._p[self._bounds_p_index]
 
         # Get solver interface
         is_qp = cs.has_conic(solver_name) and not cs.has_nlpsol(solver_name)
@@ -416,6 +420,18 @@ class CasADiSolver(Solver):
         self._solver_libs = {solver_name, solver_options.get("qpsol", solver_name)}
 
         return self
+
+    def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
+        """! Reset the parameters for the optimization problem.
+
+        @param p Specifies the parameters.
+        """
+        super().reset_parameters(p)
+        index = getattr(self, "_bounds_p_index", None)
+        if index is not None and index.size > 0:
+            if not np.array_equal(self._p[index], self._bounds_p):
+                self._bounds_p = self._p[index]
+                self._lbg, self._ubg = self._bounds(self._p)
 
     def _solve(self) -> CasADiArrayType:
         """! Solve the optimization problem using the CasADi interface.
@@ -482,8 +498,7 @@ class CasADiSolver(Solver):
         )
         solver_input = {"x0": self._x0, "p": p}
         if self.opt_type in CONSTRAINED_OPT:
-            solver_input["lbg"] = self._lbg
-            solver_input["ubg"] = self._ubg
+            solver_input["lbg"], solver_input["ubg"] = self._bounds(p)
         x = self._solver(**solver_input)["x"]
         res = [
             cs.reshape(x[self._x_layout[l][0]], *self._x_layout[l][1]) for l in outputs

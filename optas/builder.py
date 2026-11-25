@@ -86,6 +86,10 @@ class OptimizationBuilder:
         ## SXContainer containing the equality constraints.
         self._eq_constraints = SXContainer()
 
+        ## Every constraint as (lower, expression, upper), in the order added: one row
+        ## per equality and per bound constraint (see Optimization.specify_bounded_constraints).
+        self._constraint_rows = {}
+
         # Setup decision variables and parameters
         for model in self._models:
             for d in model.time_derivs:
@@ -315,6 +319,7 @@ class OptimizationBuilder:
             self._lin_ineq_constraints[name] = diff
         else:
             self._ineq_constraints[name] = diff
+        self._constraint_rows[name] = (0.0, diff, cs.inf)
 
     @arrayify_args
     def add_bound_inequality_constraint(
@@ -333,6 +338,11 @@ class OptimizationBuilder:
         """
         self.add_leq_inequality_constraint(name + "_l", lhs, mid)
         self.add_leq_inequality_constraint(name + "_r", mid, rhs)
+        x = self._x()
+        if not (cs.depends_on(lhs, x) or cs.depends_on(rhs, x)):
+            # One row lhs <= mid <= rhs instead of two (bounds may depend on parameters)
+            del self._constraint_rows[name + "_l"], self._constraint_rows[name + "_r"]
+            self._constraint_rows[name] = (lhs, mid, rhs)
 
     @arrayify_args
     def add_equality_constraint(
@@ -358,6 +368,7 @@ class OptimizationBuilder:
             self._lin_eq_constraints[name] = diff
         else:
             self._eq_constraints[name] = diff
+        self._constraint_rows[name] = (0.0, diff, 0.0)
 
     #
     # Common constraints
@@ -631,5 +642,6 @@ class OptimizationBuilder:
                     )
 
         opt.set_models(self._models)
+        opt.specify_bounded_constraints(self._constraint_rows)
 
         return opt

@@ -11,7 +11,7 @@ import casadi as cs
 
 
 def isclose(A: np.ndarray, B: np.ndarray):
-    return np.isclose(np.asarray(A, dtype=float), B).all()
+    return np.isclose(np.asarray(A, dtype=float).ravel(), np.ravel(B)).all()
 
 
 ###########################################################################
@@ -180,3 +180,45 @@ class TestCodegen(_SolverTester):
         solver = self.setup_solver("qpoases")  # CasADi can't generate qpOASES
         with pytest.raises(RuntimeError):
             solver.generate(solver.to_function("booth"), str(tmp_path))
+
+
+class TestBoundedConstraints:
+    @staticmethod
+    def build():
+        # min ||x - t||^2  s.t.  x0 + x1 = t,  lo <= x <= hi
+        builder = optas.OptimizationBuilder(T=1)
+        x = builder.add_decision_variables("x", 2)
+        lo = builder.add_parameter("lo", 2)
+        hi = builder.add_parameter("hi", 2)
+        t = builder.add_parameter("t")
+        builder.add_cost_term("f", optas.sumsqr(x - t))
+        builder.add_equality_constraint("sum", x[0] + x[1], t)
+        builder.add_bound_inequality_constraint("box", lo, x, hi)
+        return builder, x
+
+    def test_rows(self):
+        builder, x = self.build()
+        builder.add_leq_inequality_constraint("leq", x[0], 10.0)
+        builder.add_bound_inequality_constraint("x_dep", x[1] - 5.0, x[0], 5.0)
+        opt = builder.build()
+        # one row per equality and bound; a bound that uses x is two rows
+        assert opt.ncon == 1 + 2 + 1 + 2
+        assert opt.nv == 2 + 4 + 1 + 2  # v(x, p) >= 0 form, unchanged
+
+    @pytest.mark.parametrize(
+        "solver_name", ["qpoases", "qrqp"] + ["daqp"] * cs.has_conic("daqp")
+    )
+    def test_parameter_bounds(self, solver_name):
+        options = TestCodegen.options[solver_name]
+        solver = optas.CasADiSolver(self.build()[0].build()).setup(solver_name, options)
+        p = {"lo": [-1.0, -1.0], "hi": [1.0, 1.0], "t": 1.0}
+        solver.reset_parameters(p)
+        assert isclose(solver.solve()["x"], [0.5, 0.5])
+        # new bounds must take effect (they are only re-evaluated when they change)
+        solver.reset_parameters({**p, "hi": [0.2, 1.0]})
+        assert isclose(solver.solve()["x"], [0.2, 0.8])
+        solver.reset_parameters(p)
+        assert isclose(solver.solve()["x"], [0.5, 0.5])
+        # and as inputs of to_function
+        F = solver.to_function("F", inputs=["hi"])
+        assert isclose(F([0.2, 1.0]), [0.2, 0.8])
