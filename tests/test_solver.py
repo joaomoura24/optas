@@ -1,3 +1,5 @@
+import os
+import shutil
 import optas
 import pytest
 import numpy as np
@@ -9,7 +11,7 @@ import casadi as cs
 
 
 def isclose(A: np.ndarray, B: np.ndarray):
-    return np.isclose(A, B).all()
+    return np.isclose(np.asarray(A, dtype=float), B).all()
 
 
 ###########################################################################
@@ -134,3 +136,47 @@ def test_reset_layout():
     assert solution["X"].shape == (2, 3)
     assert isclose(solution["X"].toarray(), A_val)
     assert isclose(solution["y"].toarray(), 7.0)
+
+
+class TestCodegen(_SolverTester):
+    # Booth function with a = 2, b = 7 has its minimum at x = 1, y = 3
+    options = {
+        "qpoases": {"printLevel": "none"},
+        "qrqp": {"print_iter": False, "print_header": False, "print_info": False},
+        "daqp": {},
+    }
+
+    def setup_solver(self, solver_name):
+        opt = self.setup_optimization(constraint=True)
+        solver = optas.CasADiSolver(opt).setup(solver_name, self.options[solver_name])
+        solver.reset_parameters({"a": 2.0, "b": 0.0})
+        return solver
+
+    def test_to_function(self):
+        solver = self.setup_solver("qpoases")
+        # b is an input, a keeps the value given to reset_parameters
+        F = solver.to_function("booth", inputs=["b"], outputs=["y", "x"])
+        assert F.name_in() == ["b"] and F.name_out() == ["y", "x"]
+        y, x = F(7.0)
+        assert isclose(x, 1.0) and isclose(y, 3.0)
+        # default: every parameter in, every decision variable out
+        F = solver.to_function("booth_all")
+        assert F.name_in() == ["a", "b"] and F.name_out() == ["x", "y"]
+        assert isclose(F(a=2.0, b=7.0)["y"], 3.0)
+
+    @pytest.mark.skipif(shutil.which("gcc") is None, reason="gcc not installed")
+    @pytest.mark.parametrize("solver_name", ["qrqp"] + ["daqp"] * cs.has_conic("daqp"))
+    def test_generate(self, solver_name, tmp_path):
+        solver = self.setup_solver(solver_name)
+        F = solver.to_function("booth", inputs=["a", "b"])
+        lib = solver.generate(F, str(tmp_path / "gen"))
+        assert os.path.exists(tmp_path / "gen" / "booth.h")
+        G = cs.external("booth", lib)
+        x, y = G(2.0, 7.0)
+        assert isclose(x, 1.0) and isclose(y, 3.0)
+
+    @pytest.mark.skipif(shutil.which("gcc") is None, reason="gcc not installed")
+    def test_generate_unsupported_solver(self, tmp_path):
+        solver = self.setup_solver("qpoases")  # CasADi can't generate qpOASES
+        with pytest.raises(RuntimeError):
+            solver.generate(solver.to_function("booth"), str(tmp_path))

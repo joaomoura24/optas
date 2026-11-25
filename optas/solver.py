@@ -1,3 +1,5 @@
+import os
+import subprocess
 import numpy as np
 import casadi as cs
 from dataclasses import dataclass
@@ -410,6 +412,9 @@ class CasADiSolver(Solver):
         ## Instance of the CasADi solver.
         self._solver = sol("solver", solver_name, problem, solver_options)
 
+        # Solver libraries that generated code links (e.g. daqp, or the QP solver of sqpmethod)
+        self._solver_libs = {solver_name, solver_options.get("qpsol", solver_name)}
+
         return self
 
     def _solve(self) -> CasADiArrayType:
@@ -448,6 +453,87 @@ class CasADiSolver(Solver):
         @return Number of iterations.
         """
         return self.stats()["iter_count"]
+
+    def to_function(
+        self,
+        name: str,
+        inputs: Optional[List[str]] = None,
+        outputs: Optional[List[str]] = None,
+    ) -> cs.Function:
+        """! CasADi function that solves the problem: parameters in, decision variables out.
+
+        Parameters that are not inputs keep the values last given to reset_parameters,
+        and the initial seed is the one last given to reset_initial_seed. The function
+        can be called from Python, or turned into C with generate().
+
+        @param name Name of the function (a valid C identifier, for generate).
+        @param inputs Parameter labels that become inputs, in order. Default: all parameters.
+        @param outputs Decision variable labels to return, in order. Default: all decision variables.
+        @return CasADi function whose inputs and outputs are named after the labels.
+        """
+        inputs = list(self._p_layout) if inputs is None else list(inputs)
+        outputs = list(self._x_layout) if outputs is None else list(outputs)
+        args = {label: cs.MX.sym(label, *self._p_layout[label][1]) for label in inputs}
+        p = cs.vertcat(
+            *[
+                cs.vec(args[label]) if label in args else cs.DM(self._p[sl])
+                for label, (sl, _) in self._p_layout.items()
+            ]
+        )
+        solver_input = {"x0": self._x0, "p": p}
+        if self.opt_type in CONSTRAINED_OPT:
+            solver_input["lbg"] = self._lbg
+            solver_input["ubg"] = self._ubg
+        x = self._solver(**solver_input)["x"]
+        res = [
+            cs.reshape(x[self._x_layout[l][0]], *self._x_layout[l][1]) for l in outputs
+        ]
+        return cs.Function(name, list(args.values()), res, inputs, outputs)
+
+    def generate(
+        self, function: cs.Function, directory: str, compile: bool = True
+    ) -> str:
+        """! Generate C code for a function from to_function, and compile it.
+
+        Writes <name>.c and <name>.h into directory and, when compile is True, builds
+        lib<name>.so with gcc, linking the solver library shipped with CasADi (e.g.
+        daqp or highs). Only solvers that CasADi can generate code for work, e.g.
+        qrqp, daqp, highs, or sqpmethod using one of them as its qpsol; qpoases,
+        proxqp and ipopt do not. The function returns non-zero when the solver fails
+        (CasADi's QP solvers do by default, see their error_on_fail option).
+
+        Load the library with casadi.external(name, path), or with dlopen from C/C++
+        through the CasADi C API declared in the header.
+
+        @param function Function returned by to_function.
+        @param directory Output directory, created if needed.
+        @param compile When False, only the C code and header are written.
+        @return Path to the shared library, or to the C file when compile is False.
+        """
+        os.makedirs(directory, exist_ok=True)
+        name = function.name()
+        cg = cs.CodeGenerator(name + ".c", {"with_header": True})
+        cg.add(function)
+        c_file = cg.generate(os.path.join(directory, ""))
+        if not compile:
+            return c_file
+
+        casadi_dir = os.path.dirname(cs.__file__)
+        flags = [f"-I{os.path.join(casadi_dir, 'include')}"]
+        for lib in sorted(self._solver_libs):
+            if os.path.isdir(os.path.join(casadi_dir, "include", lib)):
+                flags.append(f"-I{os.path.join(casadi_dir, 'include', lib)}")
+            if os.path.exists(os.path.join(casadi_dir, f"lib{lib}.so")):
+                flags += [f"-L{casadi_dir}", f"-l{lib}", f"-Wl,-rpath,{casadi_dir}"]
+        so_file = os.path.join(directory, f"lib{name}.so")
+        cmd = ["gcc", "-O3", "-fPIC", "-shared", c_file, "-o", so_file, *flags, "-lm"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"compiling {c_file} failed (can CasADi generate code for "
+                f"{sorted(self._solver_libs)}?):\n{result.stderr}"
+            )
+        return so_file
 
 
 ################################################################
