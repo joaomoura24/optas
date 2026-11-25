@@ -1,5 +1,7 @@
 import optas
+import pytest
 import numpy as np
+import casadi as cs
 
 ###########################################################################
 # Helper methods
@@ -53,12 +55,17 @@ class TestSolverInterface(_SolverTester):
         assert solver.did_solve(), f"did_solve returns false for {name}"
 
     def test_casadi_interface(self):
-        qp_solver_names = ["qpoases"]
+        # any solver plugin CasADi has, not a fixed list (daqp needs casadi >= 3.7)
+        qp_solver_names = ["qpoases", "qrqp"] + ["daqp"] * cs.has_conic("daqp")
         nlp_solver_names = ["ipopt", "sqpmethod"]
         for solver_name in qp_solver_names + nlp_solver_names:
-            opt = self.setup_optimization()
+            opt = self.setup_optimization(constraint=True)
             solver = optas.CasADiSolver(opt).setup(solver_name)
-            self.solve_and_check_solution(solver)
+            self.solve_and_check_solution(solver, solver_name)
+
+    def test_casadi_unknown_solver(self):
+        with pytest.raises(ValueError):
+            optas.CasADiSolver(self.setup_optimization()).setup("no_such_solver")
 
     def test_osqp_interface(self):
         opt = self.setup_optimization(True)  # OSQP fails for unconstrained
@@ -92,3 +99,38 @@ class TestSolverInterface(_SolverTester):
             opt = self.setup_optimization()
             solver = optas.ScipyMinimizeSolver(opt).setup(method=solver_name, tol=1e-6)
             self.solve_and_check_solution(solver, solver_name)
+
+
+def test_reset_layout():
+    """reset_parameters/reset_initial_seed match SXContainer.dict2vec."""
+    builder = optas.OptimizationBuilder(T=1)
+    X = builder.add_decision_variables("X", 2, 3)
+    y = builder.add_decision_variables("y")
+    A = builder.add_parameter("A", 2, 3)
+    b = builder.add_parameter("b")
+    builder.add_cost_term("f", optas.sumsqr(X - A) + (y - b) ** 2)
+    opt = builder.build()
+    solver = optas.CasADiSolver(opt).setup("qpoases")
+
+    A_val = np.arange(6.0).reshape(2, 3)  # column-major order matters
+    for p in [
+        {"A": A_val, "b": 7.0},
+        {"A": optas.DM(A_val), "b": [7.0], "unknown": 1.0},  # unknown is ignored
+        {"b": 7.0},  # missing labels are zero
+    ]:
+        solver.reset_parameters(p)
+        assert isclose(solver.p.toarray(), opt.parameters.dict2vec(p).toarray())
+        x0 = {"X": p.get("A", 0 * A_val)}
+        solver.reset_initial_seed(x0)
+        assert isclose(
+            solver.x0.toarray(), opt.decision_variables.dict2vec(x0).toarray()
+        )
+
+    with pytest.raises(ValueError):
+        solver.reset_parameters({"A": np.ones(5)})  # wrong size
+
+    solver.reset_parameters({"A": A_val, "b": 7.0})
+    solution = solver.solve()
+    assert solution["X"].shape == (2, 3)
+    assert isclose(solution["X"].toarray(), A_val)
+    assert isclose(solution["y"].toarray(), 7.0)

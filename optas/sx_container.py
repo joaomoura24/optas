@@ -3,7 +3,7 @@
 import collections
 import casadi as cs
 import numpy as np
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Tuple
 
 from .spatialmath import ArrayType
 
@@ -96,6 +96,17 @@ class SXContainer(collections.OrderedDict):
         """
         return self.vec().numel()
 
+    def layout(self) -> Dict[str, Tuple[slice, Tuple[int, int]]]:
+        """! Position and shape of each item in the vectorized container.
+
+        @return Dictionary mapping each label to its slice in vec() and its shape.
+        """
+        out, start = {}, 0
+        for label, value in self.items():
+            out[label] = (slice(start, start + value.numel()), value.shape)
+            start += value.numel()
+        return out
+
     def vec2dict(self, vec: Union[DM, np.ndarray, list, tuple]) -> dict:
         """! Convert vector with same layout as SXContainer to dict.
 
@@ -119,7 +130,7 @@ class SXContainer(collections.OrderedDict):
         """
         out_vec = cs.DM()
         for label, value in self.items():
-            v = d.get(label, cs.DM.zeros(*value.shape))
+            v = d[label] if label in d else cs.DM.zeros(*value.shape)
             out_vec = cs.vertcat(out_vec, cs.vec(v))
         return out_vec
 

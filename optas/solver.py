@@ -56,6 +56,34 @@ MIXED_INTEGER_OPT = {
 # Solver base class
 
 
+def _pack(buf: np.ndarray, layout: Dict, values: Dict[str, ArrayType]) -> None:
+    """! Write values into buf in place, with the layout of an SXContainer.
+
+    Labels missing from values are zero and unknown labels are ignored, as in
+    SXContainer.dict2vec.
+    """
+    buf[:] = 0.0
+    for label, value in values.items():
+        if label in layout:
+            sl, shape = layout[label]
+            v = np.asarray(value, dtype=float).ravel(order="F")
+            if v.size != sl.stop - sl.start:
+                raise ValueError(
+                    f"'{label}' has {v.size} elements, expected shape {shape}"
+                )
+            buf[sl] = v
+
+
+def _unpack(vec: ArrayType, layout: Dict) -> Dict[str, cs.DM]:
+    """! Split vec into a dictionary, with the layout of an SXContainer."""
+    vec = cs.vec(vec if isinstance(vec, cs.DM) else cs.DM(vec))
+    offsets = [sl.start for sl, _ in layout.values()] + [vec.numel()]
+    out = {}
+    for (label, (_, shape)), v in zip(layout.items(), cs.vertsplit(vec, offsets)):
+        out[label] = v if shape[1] == 1 else cs.reshape(v, *shape)
+    return out
+
+
 class Solver(ABC):
     """! Base solver interface class"""
 
@@ -70,14 +98,13 @@ class Solver(ABC):
         ## Instance of the optimization problem.
         self.opt = optimization
 
-        ## Initial guess for the optimization problem (set using reset_initial_seed).
-        self.x0 = cs.DM.zeros(optimization.nx)
+        # Slice and shape of every decision variable and parameter, computed once
+        self._x_layout = optimization.decision_variables.layout()
+        self._p_layout = optimization.parameters.layout()
 
-        ## Parameter vector.
-        self.p = cs.DM.zeros(optimization.np)
-
-        ## Parameter dictionary.
-        self._p_dict = {}
+        # Initial seed and parameter vectors, written in place on every reset
+        self._x0 = np.zeros(optimization.nx)
+        self._p = np.zeros(optimization.np)
 
         ## When True, after solve() is called, if the solver did not converge then a RuntimeError is thrown.
         self._error_on_fail = error_on_fail
@@ -98,20 +125,29 @@ class Solver(ABC):
         """! Setup solver, note this method must return self. This is an abstract method."""
         pass
 
+    @property
+    def x0(self) -> cs.DM:
+        """! Initial guess for the optimization problem (set using reset_initial_seed)."""
+        return cs.DM(self._x0)
+
+    @property
+    def p(self) -> cs.DM:
+        """! Parameter vector (set using reset_parameters)."""
+        return cs.DM(self._p)
+
     def reset_initial_seed(self, x0: Dict[str, ArrayType]) -> None:
         """! Reset initial seed for the optimization problem.
 
         @param x0 The initial seed.
         """
-        self.x0 = self.opt.decision_variables.dict2vec(x0)
+        _pack(self._x0, self._x_layout, x0)
 
     def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
         """! Reset the parameters for the optimization problem.
 
         @param p Specifies the parameters.
         """
-        self.p = self.opt.parameters.dict2vec(p)
-        self._p_dict = self.opt.parameters.vec2dict(self.p)
+        _pack(self._p, self._p_layout, p)
 
     @abstractmethod
     def _solve(self) -> CasADiArrayType:
@@ -126,7 +162,8 @@ class Solver(ABC):
 
         @return A dictionary containing the solution.
         """
-        solution = self.opt.decision_variables.vec2dict(self._solve())
+        solution = _unpack(self._solve(), self._x_layout)
+        p_dict = None  # parameter dictionary, only built if a model needs it
 
         if self._error_on_fail and (not self.did_solve()):
             raise RuntimeError("Solver failed!")
@@ -144,9 +181,9 @@ class Solver(ABC):
                         solution[n_s][model.optimized_joint_indexes, :] = solution[
                             n_s_x
                         ]
-                        solution[n_s][model.parameter_joint_indexes, :] = self._p_dict[
-                            n_s_p
-                        ]
+                        if p_dict is None:
+                            p_dict = _unpack(self._p, self._p_layout)
+                        solution[n_s][model.parameter_joint_indexes, :] = p_dict[n_s_p]
                     else:
                         solution[n_s] = solution[n_s_x]
                 else:
@@ -319,19 +356,10 @@ class Solver(ABC):
 class CasADiSolver(Solver):
     """! This is a base class for CasADi solver interfaces."""
 
-    ## Possible mixed-integer solvers
-    mi_solvers = {"bonmin", "knitro"}
-
-    ## Possible NLP solvers.
-    nlp_solvers = {"ipopt", "knitro", "snopt", "worhp", "scpgen", "sqpmethod"}
-
-    ## Possible QP solvers.
-    qp_solvers = {"cplex", "gurobi", "ooqp", "qpoases", "sqic", "nlp"}
-
     def setup(self, solver_name: str, solver_options: Optional[Dict] = None):
         """! Setup the optimization solver.
 
-        @param solver_name The name of the solver to be used.
+        @param solver_name The name of the solver to be used: any QP (conic) or NLP solver plugin available in CasADi, e.g. qpoases, osqp, daqp, proxqp, qrqp, highs, ipopt, bonmin, sqpmethod. Mixed-integer problems need an NLP solver that supports them (e.g. bonmin).
         @param solver_options Solver options passed to the solver. For details, see
             - https://casadi.sourceforge.net/v3.0.0/api/html/d9/d37/group__qpsol.html, and
             - https://casadi.sourceforge.net/v2.0.0/api/html/d6/d07/classcasadi_1_1NlpSolver.html
@@ -341,10 +369,11 @@ class CasADiSolver(Solver):
         x = self.opt.decision_variables.vec()
         p = self.opt.parameters.vec()
 
+        # cse: remove repeated subexpressions (e.g. forward kinematics in Jacobians)
         problem = {
             "x": x,
             "p": p,
-            "f": self.opt.f(x, p),
+            "f": cs.cse(self.opt.f(x, p)),
         }
 
         # Setup constraints
@@ -356,18 +385,19 @@ class CasADiSolver(Solver):
         self._ubg = None
 
         if self.opt_type in CONSTRAINED_OPT:
-            problem["g"] = self.opt.v(x, p)
+            problem["g"] = cs.cse(self.opt.v(x, p))
             self._lbg = self.opt.lbv
             self._ubg = self.opt.ubv
 
         # Get solver interface
-        if (solver_name in self.qp_solvers) and not self.opt.has_discrete_variables():
+        is_qp = cs.has_conic(solver_name) and not cs.has_nlpsol(solver_name)
+        if is_qp and not self.opt.has_discrete_variables():
             sol = cs.qpsol
-        elif (solver_name in self.nlp_solvers) or (solver_name in self.mi_solvers):
+        elif cs.has_nlpsol(solver_name):
             sol = cs.nlpsol
         else:
             raise ValueError(
-                f"solver '{solver_name}' does not support this problem type"
+                f"solver '{solver_name}' is not available in CasADi or does not support this problem type"
             )
 
         # Check for discrete variables
@@ -387,13 +417,12 @@ class CasADiSolver(Solver):
 
         @return Solution to the problem.
         """
-        solver_input = {"x0": self.x0, "p": self.p}
+        solver_input = {"x0": self._x0, "p": self._p}
         if self.opt_type in CONSTRAINED_OPT:
             solver_input["lbg"] = self._lbg
             solver_input["ubg"] = self._ubg
         self._solution = self._solver(**solver_input)
-        self._stats = self._solver.stats()
-        self._stats["solution"] = self._solution
+        self._stats = None  # fetched from the solver when first asked for
         return self._solution["x"]
 
     def stats(self) -> Dict:
@@ -401,6 +430,9 @@ class CasADiSolver(Solver):
 
         @return Dictionary containing the statistics.
         """
+        if self._stats is None:
+            self._stats = self._solver.stats()
+            self._stats["solution"] = self._solution
         return self._stats
 
     def did_solve(self) -> bool:
@@ -408,14 +440,14 @@ class CasADiSolver(Solver):
 
         @return Boolean indicating success of solver.
         """
-        return self._stats["success"]
+        return self.stats()["success"]
 
     def number_of_iterations(self) -> int:
         """! Number of iterations it took the solver to converge.
 
         @return Number of iterations.
         """
-        return self._stats["iter_count"]
+        return self.stats()["iter_count"]
 
 
 ################################################################
@@ -453,17 +485,17 @@ class OSQPSolver(Solver):
         """! Internal method to reset parameters."""
         self._setup_input = {
             **self._settings,
-            "P": csc_matrix(2.0 * self.opt.P(self.p).toarray()),
-            "q": self.opt.q(self.p).toarray().flatten(),
+            "P": csc_matrix(2.0 * self.opt.P(self._p).toarray()),
+            "q": self.opt.q(self._p).toarray().flatten(),
         }
         if self.opt_type in CONSTRAINED_OPT:
             # M x + c >= 0 and A x + b = 0, i.e. l <= [M; A] x <= u
-            b = self.opt.b(self.p).toarray().flatten()
+            b = self.opt.b(self._p).toarray().flatten()
             self._setup_input["A"] = csc_matrix(
-                cs.vertcat(self.opt.M(self.p), self.opt.A(self.p)).toarray()
+                cs.vertcat(self.opt.M(self._p), self.opt.A(self._p)).toarray()
             )
             self._setup_input["l"] = np.concatenate(
-                [-self.opt.c(self.p).toarray().flatten(), -b]
+                [-self.opt.c(self._p).toarray().flatten(), -b]
             )
             self._setup_input["u"] = np.concatenate([np.full(self.opt.nk, np.inf), -b])
 
@@ -479,7 +511,7 @@ class OSQPSolver(Solver):
 
         # Warm start optimization
         if self.use_warm_start:
-            self.m.warm_start(x=self.x0.toarray().flatten())
+            self.m.warm_start(x=self._x0)
 
         # Solve problem
         self._solution = self.m.solve()
@@ -543,17 +575,17 @@ class CVXOPTSolver(Solver):
     def _reset_parameters(self):
         """! Internal method to reset parameters."""
         cvxopt = self._cvxopt
-        self._solver_input["P"] = cvxopt.matrix(2.0 * self.opt.P(self.p).toarray())
-        self._solver_input["q"] = cvxopt.matrix(self.opt.q(self.p).toarray().flatten())
+        self._solver_input["P"] = cvxopt.matrix(2.0 * self.opt.P(self._p).toarray())
+        self._solver_input["q"] = cvxopt.matrix(self.opt.q(self._p).toarray().flatten())
         if self.opt_type in CONSTRAINED_OPT:
             if self.opt.nk > 0:
-                self._solver_input["G"] = cvxopt.matrix(-self.opt.M(self.p).toarray())
+                self._solver_input["G"] = cvxopt.matrix(-self.opt.M(self._p).toarray())
                 self._solver_input["h"] = cvxopt.matrix(
-                    self.opt.c(self.p).toarray().flatten()
+                    self.opt.c(self._p).toarray().flatten()
                 )
             if self.opt.na > 0:
-                self._solver_input["A"] = cvxopt.matrix(self.opt.A(self.p).toarray())
-                self._solver_input["b"] = cvxopt.matrix(-self.opt.b(self.p).toarray())
+                self._solver_input["A"] = cvxopt.matrix(self.opt.A(self._p).toarray())
+                self._solver_input["b"] = cvxopt.matrix(-self.opt.b(self._p).toarray())
 
     def _solve(self) -> CasADiArrayType:
         """! Solve the optimization problem using CVXOPT.
@@ -656,7 +688,7 @@ class ScipyMinimizeSolver(Solver):
         self.minimize_input = {
             "fun": self.f,
             "method": method,
-            "x0": self.x0.toarray().flatten(),
+            "x0": self._x0.copy(),
         }
 
         if tol is not None:
@@ -684,15 +716,15 @@ class ScipyMinimizeSolver(Solver):
             else:
                 if self.opt.nk:
                     self._constraints["k"] = LinearConstraint(
-                        A=csc_matrix(self.opt.M(self.p).toarray()),
-                        lb=-self.opt.c(self.p).toarray().flatten(),
+                        A=csc_matrix(self.opt.M(self._p).toarray()),
+                        lb=-self.opt.c(self._p).toarray().flatten(),
                         ub=self.opt.inf * np.ones(self.opt.nk),
                     )
 
                 if self.opt.na:
-                    eq = -self.opt.b(self.p).toarray().flatten()
+                    eq = -self.opt.b(self._p).toarray().flatten()
                     self._constraints["a"] = LinearConstraint(
-                        A=csc_matrix(self.opt.A(self.p).toarray()),
+                        A=csc_matrix(self.opt.A(self._p).toarray()),
                         lb=eq,
                         ub=eq,
                     )
@@ -719,47 +751,47 @@ class ScipyMinimizeSolver(Solver):
 
     def f(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return float(self.opt.f(x, self.p).toarray().flatten()[0])
+        return float(self.opt.f(x, self._p).toarray().flatten()[0])
 
     def jac(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.df(x, self.p).toarray().flatten()
+        return self.opt.df(x, self._p).toarray().flatten()
 
     def hess(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.ddf(x, self.p).toarray()
+        return self.opt.ddf(x, self._p).toarray()
 
     def v(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.v(x, self.p).toarray().flatten()
+        return self.opt.v(x, self._p).toarray().flatten()
 
     def dv(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.dv(x, self.p).toarray()
+        return self.opt.dv(x, self._p).toarray()
 
     def g(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.g(x, self.p).toarray().flatten()
+        return self.opt.g(x, self._p).toarray().flatten()
 
     def dg(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.dg(x, self.p).toarray()
+        return self.opt.dg(x, self._p).toarray()
 
     def ddg(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.ddg(x, self.p).toarray()
+        return self.opt.ddg(x, self._p).toarray()
 
     def h(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.h(x, self.p).toarray().flatten()
+        return self.opt.h(x, self._p).toarray().flatten()
 
     def dh(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.dh(x, self.p).toarray()
+        return self.opt.dh(x, self._p).toarray()
 
     def ddh(self, x: cs.np.ndarray) -> cs.np.ndarray:
         """! Internal method."""
-        return self.opt.ddh(x, self.p).toarray()
+        return self.opt.ddh(x, self._p).toarray()
 
     def reset_initial_seed(self, x0) -> None:
         """! Reset initial seed for the optimization problem.
@@ -767,7 +799,7 @@ class ScipyMinimizeSolver(Solver):
         @param x0 The initial seed.
         """
         super().reset_initial_seed(x0)
-        self.minimize_input["x0"] = self.x0.toarray().flatten()
+        self.minimize_input["x0"] = self._x0.copy()
 
     def reset_parameters(self, p: Dict[str, ArrayType]):
         """! Reset the parameters.
@@ -777,11 +809,11 @@ class ScipyMinimizeSolver(Solver):
         super().reset_parameters(p)
         if self.method == "trust-constr":
             if self.opt.nk:
-                self._constraints["k"].A = csc_matrix(self.opt.M(self.p).toarray())
-                self._constraints["k"].lb = -self.opt.c(self.p).toarray().flatten()
+                self._constraints["k"].A = csc_matrix(self.opt.M(self._p).toarray())
+                self._constraints["k"].lb = -self.opt.c(self._p).toarray().flatten()
             if self.opt.na:
-                eq = -self.opt.b(self.p).toarray().flatten()
-                self._constraints["a"].A = csc_matrix(self.opt.A(self.p).toarray())
+                eq = -self.opt.b(self._p).toarray().flatten()
+                self._constraints["a"].A = csc_matrix(self.opt.A(self._p).toarray())
                 self._constraints["a"].lb = eq
                 self._constraints["a"].ub = eq
         if self._constraints:
