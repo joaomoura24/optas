@@ -132,6 +132,21 @@ vis.start()
 Run the example script [example.py](example/example.py).
 Other examples, including dual-arm planning, Model Predictive Control, Trajectory Optimization, etc can be found in the [example/](example) directory.
 
+## Code generation
+
+A problem solved with `CasADiSolver` can be turned into C and compiled (needs `gcc`), e.g. to call it from a C++ controller:
+
+```python
+# The example has nonlinear constraints: SQP with qrqp for the QP steps (for a QP: daqp, qrqp or highs)
+solver = optas.CasADiSolver(optimization).setup("sqpmethod", {"qpsol": "qrqp"})
+solver.reset_parameters({"q_nominal": q_nominal})  # parameters that are not inputs keep these values
+solver.reset_initial_seed({f"{name}/q": q_nominal})
+F = solver.to_function("ik", inputs=["p_goal"], outputs=[f"{name}/q/x"])
+library = solver.generate(F, "build")  # build/ik.c, build/ik.h, build/libik.so
+```
+
+`to_function` returns a CasADi function that can also be called from Python. Load the library with `casadi.external("ik", library)`, or with `dlopen` through the CasADi C API in `ik.h`. CasADi can generate code for some solvers only (e.g. qrqp, daqp, highs; not qpoases, proxqp or ipopt).
+
 # Support
 
 Tested on Ubuntu 24.04 with Python 3.12 (see the [CI workflow](.github/workflows/ci.yaml)).

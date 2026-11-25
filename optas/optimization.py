@@ -2,7 +2,7 @@ import casadi as cs
 from .models import Model
 from .sx_container import SXContainer
 from .spatialmath import CasADiArrayType
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
 def derive_jacobian_and_hessian_functions(
@@ -246,6 +246,18 @@ class Optimization:
         ## Upper bound for the verticle constraints v (i.e. inf).
         self.ubv = None
 
+        ## CasADi function that evaluates all constraints as rows con(x, p), with bounds lbcon(p) <= con(x, p) <= ubcon(p) (set when specify_bounded_constraints is called).
+        self.con = None
+
+        ## CasADi function that evaluates the lower bound of con, lbcon(p).
+        self.lbcon = None
+
+        ## CasADi function that evaluates the upper bound of con, ubcon(p).
+        self.ubcon = None
+
+        ## Number of constraint rows in con.
+        self.ncon = 0
+
         # Get symbolic variables
 
         ## Vectorized decision variables.
@@ -373,6 +385,26 @@ class Optimization:
         self.nv = self.v.numel_out()
         self.lbv = cs.DM.zeros(self.nv)
         self.ubv = self.inf * cs.DM.ones(self.nv)
+
+    def specify_bounded_constraints(self, rows: Dict) -> None:
+        """! Specify all constraints as lbcon(p) <= con(x, p) <= ubcon(p).
+
+        Unlike v(x, p) >= 0, an equality or a bound constraint is one row, with equal
+        bounds for an equality. This is the form CasADi solvers take.
+
+        @param rows Dictionary of (lower, expression, upper) for each constraint.
+        """
+        lo, con, hi = [], [], []
+        for lower, expression, upper in rows.values():
+            ones = cs.DM.ones(*expression.shape)  # scalar bounds apply to every element
+            lo.append(cs.vec(lower * ones))
+            con.append(cs.vec(expression))
+            hi.append(cs.vec(upper * ones))
+        lo, con, hi = [cs.vertcat(cs.SX(0, 1), *parts) for parts in (lo, con, hi)]
+        self.con = cs.Function("con", [self.x, self.p], [con])
+        self.lbcon = cs.Function("lbcon", [self.p], [lo])
+        self.ubcon = cs.Function("ubcon", [self.p], [hi])
+        self.ncon = con.numel()
 
     def has_discrete_variables(self):
         return self.decision_variables.has_discrete_variables()
