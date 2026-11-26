@@ -170,7 +170,6 @@ class TestBoundedConstraints:
         opt = builder.build()
         # one row per equality and bound; a bound that uses x is two rows
         assert opt.ncon == 1 + 2 + 1 + 2
-        assert opt.nv == 2 + 4 + 1 + 2  # v(x, p) >= 0 form, unchanged
 
     @pytest.mark.parametrize(
         "solver_name", ["qpoases", "qrqp"] + ["daqp"] * cs.has_conic("daqp")

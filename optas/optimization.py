@@ -2,26 +2,7 @@ import casadi as cs
 from .models import Model
 from .sx_container import SXContainer
 from .spatialmath import CasADiArrayType
-from typing import Dict, List, Tuple
-
-
-def derive_jacobian_and_hessian_functions(
-    name: str, fun: cs.Function, x: CasADiArrayType, p: CasADiArrayType
-) -> Tuple[cs.Function]:
-    """! Compute the Jacobian and Hessian for a given function using automatic differentiation.
-
-    @param name The function name.
-    @param fun The CasADi function.
-    @param x The variables of the function.
-    @param p The parameters of the function.
-    @return The Jacobian and Hessian that are the derivatives of the function wrt the variables x.
-    """
-    fun_input = [x, p]
-    jac = cs.jacobian(fun(x, p), x)
-    hes = cs.jacobian(jac, x)
-    Jac = cs.Function("d" + name, fun_input, [jac])
-    Hes = cs.Function("dd" + name, fun_input, [hes])
-    return Jac, Hes
+from typing import Dict, List
 
 
 def derive_jacobian_function(
@@ -55,39 +36,12 @@ def derive_hessian_function(
     return cs.Function("dd" + name, [x, p], [hes])
 
 
-def vertcon(
-    x: CasADiArrayType,
-    p: CasADiArrayType,
-    ineq: List[cs.Function] = [],
-    eq: List[cs.Function] = [],
-) -> cs.Function:
-    """! Align inequality and equality constraints vertically.
-
-    Given an inequality constraint ineq(x, p) and equality constraint eq(x, p). The method that is returned evaluates the following array.
-
-                  [ ineq(x, p) ]
-        v(x, p) = [   eq(x, p) ]
-                  [  -eq(x, p) ]
-
-    @param x The variables of the functions.
-    @param p The parameters of the functions.
-    @param ineq A list of inequality constraints.
-    @param eq A list of equality constraints.
-    @return A CasADi function that evaluates the constraints in the form v(x, p) >= 0 (see above).
-    """
-    con = [i(x, p) for i in ineq]
-    for e in eq:
-        con.append(e(x, p))
-        con.append(-e(x, p))
-    return cs.Function("v", [x, p], [cs.vertcat(*con)])
-
-
 def _lazy_derivative(name: str, order: int, doc: str) -> property:
     """! Create a read-only property that derives (and caches) a Jacobian/Hessian on first access.
 
-    Deriving these symbolically can be expensive in time and memory, and many
-    solvers (e.g. CasADi's nlpsol) never use them, so they are only computed
-    when actually requested.
+    Deriving these symbolically can be expensive in time and memory, and the
+    CasADi solvers never use them, so they are only computed when requested
+    (e.g. by the QP matrices P and q).
     """
 
     def getter(self):
@@ -99,32 +53,11 @@ def _lazy_derivative(name: str, order: int, doc: str) -> property:
 class Optimization:
     """! Base optimization class."""
 
-    ## big number rather than np.inf
-    inf = 1.0e10
-
     ## Jacobian of the objective function (derived on first access).
     df = _lazy_derivative("f", 1, "Jacobian of the objective function.")
 
     ## Hessian of the objective function (derived on first access).
     ddf = _lazy_derivative("f", 2, "Hessian of the objective function.")
-
-    ## Jacobian of the inequality constraints g (derived on first access, None if g is not set).
-    dg = _lazy_derivative("g", 1, "Jacobian of the inequality constraints g.")
-
-    ## Hessian of the inequality constraints g (derived on first access, None if g is not set).
-    ddg = _lazy_derivative("g", 2, "Hessian of the inequality constraints g.")
-
-    ## Jacobian of the equality constraints h (derived on first access, None if h is not set).
-    dh = _lazy_derivative("h", 1, "Jacobian of the equality constraints h.")
-
-    ## Hessian of the equality constraints h (derived on first access, None if h is not set).
-    ddh = _lazy_derivative("h", 2, "Hessian of the equality constraints h.")
-
-    ## Jacobian of the constraints v (derived on first access, None if v is not set).
-    dv = _lazy_derivative("v", 1, "Jacobian of the constraints v.")
-
-    ## Hessian of the constraints v (derived on first access, None if v is not set).
-    ddv = _lazy_derivative("v", 2, "Hessian of the constraints v.")
 
     def __init__(
         self,
@@ -180,12 +113,6 @@ class Optimization:
         ## Number of linear inequality constraints.
         self.nk = 0
 
-        ## Lower bound for the linear inequality constraints (i.e. zeros).
-        self.lbk = None
-
-        ## Upper bound for the linear inequality constraints (i.e. inf).
-        self.ubk = None
-
         ## CasADi function that evaluates the M term in the linear inequality constraints.
         self.M = None
 
@@ -197,12 +124,6 @@ class Optimization:
 
         ## Number of linear equality constraints.
         self.na = 0
-
-        ## Lower bound for the linear equality constraints (i.e. zeros).
-        self.lba = None
-
-        ## Upper bound for the linear equality constraints (i.e. zeros).
-        self.uba = None
 
         ## CasADi function that evaluates the A term in the linear equality constraints.
         self.A = None
@@ -216,35 +137,11 @@ class Optimization:
         ## Number of inequality constraints.
         self.ng = 0
 
-        ## Lower bound for the inequality constraints (i.e. zeros).
-        self.lbg = None
-
-        ## Upper bound for the inequality constraints (i.e. inf).
-        self.ubg = None
-
         ## CasADi function that evaluates the equality constraints
         self.h = None
 
         ## Number of equality constraints.
         self.nh = 0
-
-        ## Lower bound for the equality constraints (i.e. zeros).
-        self.lbh = None
-
-        ## Upper bound for the equality constraints (i.e. zeros).
-        self.ubh = None
-
-        ## CasADi function that evaluates the constraints as a verticle column (set when specify_v is called), see vertcon.
-        self.v = None
-
-        ## Number of vectorized constraints (see vertcon).
-        self.nv = 0
-
-        ## Lower bound for the verticle constraints v (i.e. zeros).
-        self.lbv = None
-
-        ## Upper bound for the verticle constraints v (i.e. inf).
-        self.ubv = None
 
         ## CasADi function that evaluates all constraints as rows con(x, p), with bounds lbcon(p) <= con(x, p) <= ubcon(p) (set when specify_bounded_constraints is called).
         self.con = None
@@ -281,7 +178,7 @@ class Optimization:
     def _get_derivative(self, name: str, order: int):
         """! Return the Jacobian (order=1) or Hessian (order=2) of the function self.<name>, deriving it on first use.
 
-        @param name Name of the attribute holding the CasADi function (f, g, h, or v).
+        @param name Name of the attribute holding the CasADi function (e.g. f).
         @param order 1 for the Jacobian, 2 for the Hessian.
         @return The CasADi function, or None when self.<name> has not been specified.
         """
@@ -327,8 +224,6 @@ class Optimization:
         # Setup k
         self.k = cs.Function("k", [self.x, self.p], [self.lin_ineq_constraints.vec()])
         self.nk = self.lin_ineq_constraints.numel()
-        self.lbk = cs.DM.zeros(self.nk)
-        self.ubk = self.inf * cs.DM.ones(self.nk)
 
         # Setup M and c
         x_zero = cs.DM.zeros(self.nx)
@@ -340,8 +235,6 @@ class Optimization:
         # Setup a
         self.a = cs.Function("a", [self.x, self.p], [self.lin_eq_constraints.vec()])
         self.na = self.lin_eq_constraints.numel()
-        self.lba = cs.DM.zeros(self.na)
-        self.uba = cs.DM.zeros(self.na)
 
         # Setup A and b
         self.A = cs.Function(
@@ -364,33 +257,16 @@ class Optimization:
         # Setup g
         self.g = cs.Function("g", [self.x, self.p], [self.ineq_constraints.vec()])
         self.ng = self.ineq_constraints.numel()
-        self.lbg = cs.DM.zeros(self.ng)
-        self.ubg = self.inf * cs.DM.ones(self.ng)
 
         # Setup h
-        self.h = cs.Function("g", [self.x, self.p], [self.eq_constraints.vec()])
+        self.h = cs.Function("h", [self.x, self.p], [self.eq_constraints.vec()])
         self.nh = self.eq_constraints.numel()
-        self.lbh = cs.DM.zeros(self.nh)
-        self.ubh = cs.DM.zeros(self.nh)
-
-    def specify_v(
-        self, ineq: List[cs.Function] = [], eq: List[cs.Function] = []
-    ) -> None:
-        """! Specify the vertical constraints vector v. This is only called for optimization problems that have constraints.
-
-        @param ineq List of CasADi functions that evalaute the (non)linear inequality constraints.
-        @param ineq List of CasADi functions that evalaute the (non)linear equality constraints.
-        """
-        self.v = vertcon(self.x, self.p, ineq=ineq, eq=eq)
-        self.nv = self.v.numel_out()
-        self.lbv = cs.DM.zeros(self.nv)
-        self.ubv = self.inf * cs.DM.ones(self.nv)
 
     def specify_bounded_constraints(self, rows: Dict) -> None:
         """! Specify all constraints as lbcon(p) <= con(x, p) <= ubcon(p).
 
-        Unlike v(x, p) >= 0, an equality or a bound constraint is one row, with equal
-        bounds for an equality. This is the form CasADi solvers take.
+        An equality or a bound constraint is one row (equal bounds for an equality).
+        This is the form CasADi solvers take.
 
         @param rows Dictionary of (lower, expression, upper) for each constraint.
         """
@@ -470,7 +346,6 @@ class QuadraticCostLinearConstraints(Optimization):
         super().__init__(decision_variables, parameters, cost_terms)
         self.specify_quadratic_cost()
         self.specify_linear_constraints(lin_ineq_constraints, lin_eq_constraints)
-        self.specify_v(ineq=[self.k], eq=[self.a])
 
 
 class QuadraticCostNonlinearConstraints(Optimization):
@@ -516,7 +391,6 @@ class QuadraticCostNonlinearConstraints(Optimization):
         self.specify_quadratic_cost()
         self.specify_linear_constraints(lin_ineq_constraints, lin_eq_constraints)
         self.specify_nonlinear_constraints(ineq_constraints, eq_constraints)
-        self.specify_v(ineq=[self.k, self.g], eq=[self.a, self.h])
 
 
 class NonlinearCostUnconstrained(Optimization):
@@ -584,7 +458,6 @@ class NonlinearCostLinearConstraints(Optimization):
         """
         super().__init__(decision_variables, parameters, cost_terms)
         self.specify_linear_constraints(lin_ineq_constraints, lin_eq_constraints)
-        self.specify_v(ineq=[self.k], eq=[self.a])
 
 
 class NonlinearCostNonlinearConstraints(Optimization):
@@ -628,7 +501,6 @@ class NonlinearCostNonlinearConstraints(Optimization):
         super().__init__(decision_variables, parameters, cost_terms)
         self.specify_linear_constraints(lin_ineq_constraints, lin_eq_constraints)
         self.specify_nonlinear_constraints(ineq_constraints, eq_constraints)
-        self.specify_v(ineq=[self.k, self.g], eq=[self.a, self.h])
 
 
 class MixedIntegerNonlinearCostNonlinearConstrained(NonlinearCostNonlinearConstraints):

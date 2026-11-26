@@ -18,7 +18,7 @@ def isclose(A: np.ndarray, B: np.ndarray):
 #
 
 
-def test_derive_jacobian_and_hessian_functions():
+def test_derive_jacobian_and_hessian():
     name = "test"
     x = optas.SX.sym("x", 2)
     p = optas.SX.sym("p", 2)
@@ -26,7 +26,8 @@ def test_derive_jacobian_and_hessian_functions():
     f = p[0] * x[0] ** 2 + p[1] * x[1] ** 3
     fun = optas.Function("fun", [x, p], [f])
 
-    Jac, Hes = optas.optimization.derive_jacobian_and_hessian_functions(name, fun, x, p)
+    Jac = optas.optimization.derive_jacobian_function(name, fun, x, p)
+    Hes = optas.optimization.derive_hessian_function(name, fun, x, p)
 
     jac_known = optas.horzcat(2.0 * p[0] * x[0], 3.0 * p[1] * x[1] ** 2)
     Jac_known = optas.Function("test_jac_known", [x, p], [jac_known])
@@ -39,35 +40,6 @@ def test_derive_jacobian_and_hessian_functions():
         p = np.random.uniform(-10, 10, size=(2,))
         assert isclose(Jac(x, p).toarray(), Jac_known(x, p).toarray())
         assert isclose(Hes(x, p).toarray(), Hes_known(x, p).toarray())
-
-
-def test_vertcon():
-    x = optas.SX.sym("x", 2)
-    p = optas.SX.sym("p", 2)
-
-    ineq = [
-        optas.Function("i1", [x, p], [p[0] * x[0]]),
-        optas.Function("i2", [x, p], [-p[1] * x[1] ** 2]),
-    ]
-
-    eq = [
-        optas.Function("e", [x, p], [2 * x[0] - x[1]]),
-    ]
-
-    fun = optas.optimization.vertcon(x, p, ineq=ineq, eq=eq)
-
-    f_known = optas.vertcat(
-        p[0] * x[0],
-        -p[1] * x[1] ** 2,
-        2 * x[0] - x[1],
-        -2 * x[0] + x[1],
-    )
-    fun_known = optas.Function("v_known", [x, p], [f_known])
-
-    for _ in range(NUM_RANDOM):
-        x = np.random.uniform(-10, 10, size=(2,))
-        p = np.random.uniform(-10, 10, size=(2,))
-        assert isclose(fun_known(x, p).toarray(), fun(x, p).toarray())
 
 
 def test_optimization():
@@ -107,7 +79,6 @@ def test_optimization():
         "na": 0,
         "ng": 0,
         "nh": 0,
-        "nv": 0,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -149,7 +120,6 @@ def test_QuadraticCostUnconstrained():
         "na": 0,
         "ng": 0,
         "nh": 0,
-        "nv": 0,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -189,10 +159,6 @@ def test_QuadraticCostLinearConstraints():
             ]
         )
 
-    def v_known(x, p):
-        a = a_known(x, p)
-        return np.concatenate([k_known(x, p), a, -a])
-
     for _ in range(NUM_RANDOM):
         x = np.random.uniform(-10, 10, size=(6,))
         p = np.random.uniform(-10, 10)
@@ -216,9 +182,6 @@ def test_QuadraticCostLinearConstraints():
 
         assert isclose(A @ x + b, a_known(x, p))
 
-        v = opt.v(x, p).toarray().flatten()
-        assert isclose(v, v_known(x, p))
-
     attr_exp_value_map = {
         "nx": 6,
         "np": 1,
@@ -226,7 +189,6 @@ def test_QuadraticCostLinearConstraints():
         "na": 1,
         "ng": 0,
         "nh": 0,
-        "nv": 4,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -286,11 +248,6 @@ def test_QuadraticCostNonlinearConstraints():
             ]
         )
 
-    def v_known(x, p):
-        a = a_known(x, p)
-        h = h_known(x, p)
-        return np.concatenate([k_known(x, p), g_known(x, p), a, -a, h, -h])
-
     for _ in range(NUM_RANDOM):
         x = np.random.uniform(-10, 10, size=(6,))
         p = np.random.uniform(-10, 10)
@@ -314,8 +271,8 @@ def test_QuadraticCostNonlinearConstraints():
 
         assert isclose(A @ x + b, a_known(x, p))
 
-        v = opt.v(x, p).toarray().flatten()
-        assert isclose(v, v_known(x, p))
+        assert isclose(opt.g(x, p).toarray().flatten(), g_known(x, p))
+        assert isclose(opt.h(x, p).toarray().flatten(), h_known(x, p))
 
     attr_exp_value_map = {
         "nx": 6,
@@ -324,7 +281,6 @@ def test_QuadraticCostNonlinearConstraints():
         "na": 1,
         "ng": 1,
         "nh": 2,
-        "nv": 9,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -361,7 +317,6 @@ def test_NonlinearCostUnconstrained():
         "na": 0,
         "ng": 0,
         "nh": 0,
-        "nv": 0,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -403,10 +358,6 @@ def test_NonlinearCostLinearConstraints():
             ]
         )
 
-    def v_known(x, p):
-        a = a_known(x, p)
-        return np.concatenate([k_known(x, p), a, -a])
-
     for _ in range(NUM_RANDOM):
         x = np.random.uniform(-10, 10, size=(6,))
         p = np.random.uniform(-10, 10)
@@ -423,9 +374,6 @@ def test_NonlinearCostLinearConstraints():
 
         assert isclose(A @ x + b, a_known(x, p))
 
-        v = opt.v(x, p).toarray().flatten()
-        assert isclose(v, v_known(x, p))
-
     attr_exp_value_map = {
         "nx": 6,
         "np": 1,
@@ -433,7 +381,6 @@ def test_NonlinearCostLinearConstraints():
         "na": 1,
         "ng": 0,
         "nh": 0,
-        "nv": 4,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -495,11 +442,6 @@ def test_NonlinearCostNonlinearConstraints():
             ]
         )
 
-    def v_known(x, p):
-        a = a_known(x, p)
-        h = h_known(x, p)
-        return np.concatenate([k_known(x, p), g_known(x, p), a, -a, h, -h])
-
     for _ in range(NUM_RANDOM):
         x = np.random.uniform(-10, 10, size=(6,))
         p = np.random.uniform(-10, 10)
@@ -516,8 +458,8 @@ def test_NonlinearCostNonlinearConstraints():
 
         assert isclose(A @ x + b, a_known(x, p))
 
-        v = opt.v(x, p).toarray().flatten()
-        assert isclose(v, v_known(x, p))
+        assert isclose(opt.g(x, p).toarray().flatten(), g_known(x, p))
+        assert isclose(opt.h(x, p).toarray().flatten(), h_known(x, p))
 
     attr_exp_value_map = {
         "nx": 6,
@@ -526,7 +468,6 @@ def test_NonlinearCostNonlinearConstraints():
         "na": 1,
         "ng": 1,
         "nh": 2,
-        "nv": 9,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
@@ -590,11 +531,6 @@ def test_MixedIntegerNonlinearCostNonlinearConstrained():
             ]
         )
 
-    def v_known(x, p):
-        a = a_known(x, p)
-        h = h_known(x, p)
-        return np.concatenate([k_known(x, p), g_known(x, p), a, -a, h, -h])
-
     for _ in range(NUM_RANDOM):
         x = np.random.uniform(-10, 10, size=(8,)).tolist()
         for idx, discrete in enumerate(dv.discrete()):
@@ -617,8 +553,8 @@ def test_MixedIntegerNonlinearCostNonlinearConstrained():
 
         assert isclose(A @ x + b, a_known(x, p))
 
-        v = opt.v(x, p).toarray().flatten()
-        assert isclose(v, v_known(x, p))
+        assert isclose(opt.g(x, p).toarray().flatten(), g_known(x, p))
+        assert isclose(opt.h(x, p).toarray().flatten(), h_known(x, p))
 
     attr_exp_value_map = {
         "nx": 8,
@@ -627,7 +563,6 @@ def test_MixedIntegerNonlinearCostNonlinearConstrained():
         "na": 1,
         "ng": 1,
         "nh": 2,
-        "nv": 9,
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
