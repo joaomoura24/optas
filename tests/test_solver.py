@@ -79,29 +79,6 @@ class TestSolverInterface(_SolverTester):
         solver = optas.CVXOPTSolver(opt).setup()
         self.solve_and_check_solution(solver)
 
-    def test_scipy_minimize_interface(self):
-        solver_names = [
-            "Nelder-Mead",
-            "Powell",
-            "CG",
-            "BFGS",
-            "Newton-CG",
-            "L-BFGS-B",
-            "TNC",
-            "COBYLA",
-            "SLSQP",
-            "trust-constr",
-            "dogleg",
-            "trust-ncg",
-            "trust-exact",
-            "trust-krylov",
-        ]
-
-        for solver_name in solver_names:
-            opt = self.setup_optimization()
-            solver = optas.ScipyMinimizeSolver(opt).setup(method=solver_name, tol=1e-6)
-            self.solve_and_check_solution(solver, solver_name)
-
 
 def test_reset_layout():
     """reset_parameters/reset_initial_seed match SXContainer.dict2vec."""

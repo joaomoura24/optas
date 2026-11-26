@@ -57,15 +57,6 @@ def main():
     print(solution_casadi[f"{robot_name}/q"] * (180.0 / optas.pi))
     print(fk(solution_casadi[f"{robot_name}/q"]))
 
-    solver_slsqp = optas.ScipyMinimizeSolver(builder.build()).setup("SLSQP")
-    solver_slsqp.reset_initial_seed(solution_casadi)
-    # solve problem
-    solution_slsqp = solver_slsqp.solve()
-    print("***********************************")
-    print("SLSQP solution:")
-    print(solution_slsqp[f"{robot_name}/q"] * (180.0 / optas.pi))
-    print(fk(solution_slsqp[f"{robot_name}/q"]))
-
     return 0
 
 

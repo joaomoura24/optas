@@ -3,7 +3,7 @@ from casadi import *
 from .spatialmath import *
 from .models import RobotModel, TaskModel
 from .builder import OptimizationBuilder
-from .solver import CasADiSolver, OSQPSolver, CVXOPTSolver, ScipyMinimizeSolver
+from .solver import CasADiSolver, OSQPSolver, CVXOPTSolver
 
 
 def __getattr__(name):

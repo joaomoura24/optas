@@ -38,7 +38,6 @@ optimization = builder.build()
 
 # Interface optimization problem with a solver
 solver = optas.CasADiSolver(optimization).setup("ipopt")
-# solver = optas.ScipyMinimizeSolver(optimization).setup("SLSQP")
 
 # Specify a nominal configuration
 q_nominal = optas.deg2rad([0, 45, 0, -90, 0, -45, 0])

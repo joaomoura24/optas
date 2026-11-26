@@ -46,7 +46,7 @@ This example, in the script `point_mass_planner.py`, demonstrates how to plan a 
 ### Planar IK
 
 The `planar_ik.py` script contains a simple example of a possible full Inverse Kinematics (IK) implementation for a planar three Degrees of Freedom (DoF) robot arm.
-The task-space consists of the x and y position of the end-effector and the IK computes an optimal set of joint angles, using a non-linear program formulation through the CassADiSolver and the ScipyMinimizeSolver interfaces.
+The task-space consists of the x and y position of the end-effector and the IK computes an optimal set of joint angles, using a non-linear program formulation solved with `CasADiSolver` (IPOPT).
 
 ### Planar IDK
 
