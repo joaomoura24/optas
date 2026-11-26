@@ -3,7 +3,6 @@ import subprocess
 import numpy as np
 import casadi as cs
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
 from scipy.interpolate import interp1d
 from .optimization import (
     Optimization,
@@ -27,7 +26,7 @@ CONSTRAINED_OPT = {
 }
 
 ################################################################
-# Solver base class
+# Helpers
 
 
 def _pack(buf: np.ndarray, layout: Dict, values: Dict[str, ArrayType]) -> None:
@@ -58,15 +57,15 @@ def _unpack(vec: ArrayType, layout: Dict) -> Dict[str, cs.DM]:
     return out
 
 
-class Solver(ABC):
-    """! Base solver interface class"""
+class CasADiSolver:
+    """! Solves an optimization problem with a CasADi QP (conic) or NLP solver plugin."""
 
     def __init__(self, optimization: Optimization, error_on_fail: bool = False):
-        """! Constructor for the base Solver class.
+        """! Constructor for the CasADiSolver class, call setup next.
 
         @param optimization The optimization problem created by calling the build method of the OptimizationBuilder class.
         @param error_on_fail When True, after solve() is called, if the solver did not converge then a RuntimeError is thrown. Default is False.
-        @return An instance of the Solver class.
+        @return An instance of the CasADiSolver class.
         """
 
         ## Instance of the optimization problem.
@@ -86,6 +85,74 @@ class Solver(ABC):
         ## Solution container
         self._solution = None
 
+        ## Statistics of the last solve, fetched from the solver when first asked for.
+        self._stats = None
+
+        # Bounds of the constraint rows, set in setup
+        self._bounds = None
+        self._bounds_p_index = np.zeros(0, dtype=int)
+
+    def setup(self, solver_name: str, solver_options: Optional[Dict] = None):
+        """! Setup the optimization solver.
+
+        @param solver_name The name of the solver to be used: any QP (conic) or NLP solver plugin available in CasADi, e.g. qpoases, osqp, daqp, proxqp, qrqp, highs, ipopt, bonmin, sqpmethod. Mixed-integer problems need an NLP solver that supports them (e.g. bonmin).
+        @param solver_options Solver options passed to the solver. For details, see
+            - https://casadi.sourceforge.net/v3.0.0/api/html/d9/d37/group__qpsol.html, and
+            - https://casadi.sourceforge.net/v2.0.0/api/html/d6/d07/classcasadi_1_1NlpSolver.html
+        @return An instance of the CasADiSovler class.
+        """
+        # Setup problem
+        x = self.opt.decision_variables.vec()
+        p = self.opt.parameters.vec()
+
+        # cse: remove repeated subexpressions (e.g. forward kinematics in Jacobians)
+        problem = {
+            "x": x,
+            "p": p,
+            "f": cs.cse(self.opt.f(x, p)),
+        }
+
+        # Setup constraints
+
+        # Constraints lbg(p) <= g(x, p) <= ubg(p): one row per equality or bound
+        if self.opt_type in CONSTRAINED_OPT:
+            problem["g"] = cs.cse(self.opt.con(x, p))
+            lbg, ubg = self.opt.lbcon(p), self.opt.ubcon(p)
+            self._bounds = cs.Function("bounds", [p], [lbg, ubg])
+            # Evaluated here, and again on reset_parameters when the entries of p they
+            # depend on change (e.g. joint limits given as parameters rarely do)
+            self._lbg, self._ubg = self._bounds(self._p)
+            if self.opt.np > 0:
+                used = cs.which_depends(cs.vertcat(lbg, ubg), p, 1, False)
+                self._bounds_p_index = np.flatnonzero(used)
+            self._bounds_p = self._p[self._bounds_p_index]
+
+        # Get solver interface
+        is_qp = cs.has_conic(solver_name) and not cs.has_nlpsol(solver_name)
+        if is_qp and not self.opt.has_discrete_variables():
+            sol = cs.qpsol
+        elif cs.has_nlpsol(solver_name):
+            sol = cs.nlpsol
+        else:
+            raise ValueError(
+                f"solver '{solver_name}' is not available in CasADi or does not support this problem type"
+            )
+
+        # Check for discrete variables
+        solver_options = dict(solver_options or {})
+        if self.opt.has_discrete_variables():
+            solver_options["discrete"] = self.opt.decision_variables.discrete()
+
+        # Initialize solver
+
+        ## Instance of the CasADi solver.
+        self._solver = sol("solver", solver_name, problem, solver_options)
+
+        # Solver libraries that generated code links (e.g. daqp, or the QP solver of sqpmethod)
+        self._solver_libs = {solver_name, solver_options.get("qpsol", solver_name)}
+
+        return self
+
     @property
     def opt_type(self) -> type:
         """! Optimization type.
@@ -93,11 +160,6 @@ class Solver(ABC):
         @return The type of the optimization problem.
         """
         return type(self.opt)
-
-    @abstractmethod
-    def setup(self, *args, **kwargs):
-        """! Setup solver, note this method must return self. This is an abstract method."""
-        pass
 
     @property
     def x0(self) -> cs.DM:
@@ -122,14 +184,24 @@ class Solver(ABC):
         @param p Specifies the parameters.
         """
         _pack(self._p, self._p_layout, p)
+        index = self._bounds_p_index
+        if index.size > 0:
+            if not np.array_equal(self._p[index], self._bounds_p):
+                self._bounds_p = self._p[index]
+                self._lbg, self._ubg = self._bounds(self._p)
 
-    @abstractmethod
     def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem and return the optimal decision variables as an array. This is an abstract method.
+        """! Solve the optimization problem using the CasADi interface.
 
-        @return The solution from the solver.
+        @return Solution to the problem.
         """
-        pass
+        solver_input = {"x0": self._x0, "p": self._p}
+        if self.opt_type in CONSTRAINED_OPT:
+            solver_input["lbg"] = self._lbg
+            solver_input["ubg"] = self._ubg
+        self._solution = self._solver(**solver_input)
+        self._stats = None  # fetched from the solver when first asked for
+        return self._solution["x"]
 
     def solve(self) -> Dict:
         """! Solve the optimization problem.
@@ -165,13 +237,29 @@ class Solver(ABC):
 
         return solution
 
-    @abstractmethod
-    def stats(self):
-        """! Return stats from solver. The return type is specifc to the solver used. This is an abstract method.
+    def stats(self) -> Dict:
+        """! Statistics relating to the previous call to solve.
 
-        @return The statistics returned by the solver. This is specified to the solver used.
+        @return Dictionary containing the statistics.
         """
-        pass
+        if self._stats is None:
+            self._stats = self._solver.stats()
+            self._stats["solution"] = self._solution
+        return self._stats
+
+    def did_solve(self) -> bool:
+        """! True when the solver succeeded, False otherwise.
+
+        @return Boolean indicating success of solver.
+        """
+        return self.stats()["success"]
+
+    def number_of_iterations(self) -> int:
+        """! Number of iterations it took the solver to converge.
+
+        @return Number of iterations.
+        """
+        return self.stats()["iter_count"]
 
     def violated_constraints(
         self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
@@ -245,36 +333,6 @@ class Solver(ABC):
             ineq_violated_constraints,
         )
 
-    @staticmethod
-    def interpolate(traj: cs.DM, T: float, **interp_args) -> interp1d:
-        """! Interpolate a trajectory
-
-        @param traj The trajectory to be interpolated where the columns correspond to the states over time.
-        @param T The time duration of the trajectory.
-        @return An interpolated function.
-        """
-        assert isinstance(
-            traj, cs.DM
-        ), f"traj is incorrect type, got '{type(traj)}', expected casadi.DM'"
-        t = np.linspace(0, T, traj.shape[1])
-        return interp1d(t, traj.toarray(), **interp_args)
-
-    @abstractmethod
-    def did_solve(self) -> bool:
-        """! Returns true when the solver solved the previous problem, false otherwise. This is an abstract method.
-
-        @return Result of whether the solver succeeded or not.
-        """
-        pass
-
-    @abstractmethod
-    def number_of_iterations(self) -> int:
-        """! Returns the number of iterations required to solve the problem. This is an abstract method.
-
-        @return Number of iterations.
-        """
-        pass
-
     def evaluate_cost(
         self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
     ) -> CasADiArrayType:
@@ -322,125 +380,19 @@ class Solver(ABC):
 
         return cost_terms
 
+    @staticmethod
+    def interpolate(traj: cs.DM, T: float, **interp_args) -> interp1d:
+        """! Interpolate a trajectory
 
-################################################################
-# CasADi solvers (https://web.casadi.org/)
-
-
-class CasADiSolver(Solver):
-    """! This is a base class for CasADi solver interfaces."""
-
-    def setup(self, solver_name: str, solver_options: Optional[Dict] = None):
-        """! Setup the optimization solver.
-
-        @param solver_name The name of the solver to be used: any QP (conic) or NLP solver plugin available in CasADi, e.g. qpoases, osqp, daqp, proxqp, qrqp, highs, ipopt, bonmin, sqpmethod. Mixed-integer problems need an NLP solver that supports them (e.g. bonmin).
-        @param solver_options Solver options passed to the solver. For details, see
-            - https://casadi.sourceforge.net/v3.0.0/api/html/d9/d37/group__qpsol.html, and
-            - https://casadi.sourceforge.net/v2.0.0/api/html/d6/d07/classcasadi_1_1NlpSolver.html
-        @return An instance of the CasADiSovler class.
+        @param traj The trajectory to be interpolated where the columns correspond to the states over time.
+        @param T The time duration of the trajectory.
+        @return An interpolated function.
         """
-        # Setup problem
-        x = self.opt.decision_variables.vec()
-        p = self.opt.parameters.vec()
-
-        # cse: remove repeated subexpressions (e.g. forward kinematics in Jacobians)
-        problem = {
-            "x": x,
-            "p": p,
-            "f": cs.cse(self.opt.f(x, p)),
-        }
-
-        # Setup constraints
-
-        # Constraints lbg(p) <= g(x, p) <= ubg(p): one row per equality or bound
-        self._bounds = None
-        self._bounds_p_index = np.zeros(0, dtype=int)  # entries of p the bounds use
-        if self.opt_type in CONSTRAINED_OPT:
-            problem["g"] = cs.cse(self.opt.con(x, p))
-            lbg, ubg = self.opt.lbcon(p), self.opt.ubcon(p)
-            self._bounds = cs.Function("bounds", [p], [lbg, ubg])
-            # Evaluated here, and again on reset_parameters when the entries of p they
-            # depend on change (e.g. joint limits given as parameters rarely do)
-            self._lbg, self._ubg = self._bounds(self._p)
-            if self.opt.np > 0:
-                used = cs.which_depends(cs.vertcat(lbg, ubg), p, 1, False)
-                self._bounds_p_index = np.flatnonzero(used)
-            self._bounds_p = self._p[self._bounds_p_index]
-
-        # Get solver interface
-        is_qp = cs.has_conic(solver_name) and not cs.has_nlpsol(solver_name)
-        if is_qp and not self.opt.has_discrete_variables():
-            sol = cs.qpsol
-        elif cs.has_nlpsol(solver_name):
-            sol = cs.nlpsol
-        else:
-            raise ValueError(
-                f"solver '{solver_name}' is not available in CasADi or does not support this problem type"
-            )
-
-        # Check for discrete variables
-        solver_options = dict(solver_options or {})
-        if self.opt.has_discrete_variables():
-            solver_options["discrete"] = self.opt.decision_variables.discrete()
-
-        # Initialize solver
-
-        ## Instance of the CasADi solver.
-        self._solver = sol("solver", solver_name, problem, solver_options)
-
-        # Solver libraries that generated code links (e.g. daqp, or the QP solver of sqpmethod)
-        self._solver_libs = {solver_name, solver_options.get("qpsol", solver_name)}
-
-        return self
-
-    def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
-        """! Reset the parameters for the optimization problem.
-
-        @param p Specifies the parameters.
-        """
-        super().reset_parameters(p)
-        index = getattr(self, "_bounds_p_index", None)
-        if index is not None and index.size > 0:
-            if not np.array_equal(self._p[index], self._bounds_p):
-                self._bounds_p = self._p[index]
-                self._lbg, self._ubg = self._bounds(self._p)
-
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem using the CasADi interface.
-
-        @return Solution to the problem.
-        """
-        solver_input = {"x0": self._x0, "p": self._p}
-        if self.opt_type in CONSTRAINED_OPT:
-            solver_input["lbg"] = self._lbg
-            solver_input["ubg"] = self._ubg
-        self._solution = self._solver(**solver_input)
-        self._stats = None  # fetched from the solver when first asked for
-        return self._solution["x"]
-
-    def stats(self) -> Dict:
-        """! Statistics relating to the previous call to solve.
-
-        @return Dictionary containing the statistics.
-        """
-        if self._stats is None:
-            self._stats = self._solver.stats()
-            self._stats["solution"] = self._solution
-        return self._stats
-
-    def did_solve(self) -> bool:
-        """! True when the solver succeeded, False otherwise.
-
-        @return Boolean indicating success of solver.
-        """
-        return self.stats()["success"]
-
-    def number_of_iterations(self) -> int:
-        """! Number of iterations it took the solver to converge.
-
-        @return Number of iterations.
-        """
-        return self.stats()["iter_count"]
+        assert isinstance(
+            traj, cs.DM
+        ), f"traj is incorrect type, got '{type(traj)}', expected casadi.DM'"
+        t = np.linspace(0, T, traj.shape[1])
+        return interp1d(t, traj.toarray(), **interp_args)
 
     def to_function(
         self,
