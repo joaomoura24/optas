@@ -108,10 +108,8 @@ class CasADiSolver:
         """! Setup the optimization solver.
 
         @param solver_name The name of the solver to be used: any QP (conic) or NLP solver plugin available in CasADi, e.g. qpoases, osqp, daqp, proxqp, qrqp, highs, ipopt, bonmin, sqpmethod. Mixed-integer problems need an NLP solver that supports them (e.g. bonmin).
-        @param solver_options Solver options passed to the solver. For details, see
-            - https://casadi.sourceforge.net/v3.0.0/api/html/d9/d37/group__qpsol.html, and
-            - https://casadi.sourceforge.net/v2.0.0/api/html/d6/d07/classcasadi_1_1NlpSolver.html
-        @return An instance of the CasADiSovler class.
+        @param solver_options Options passed to the CasADi plugin (see https://web.casadi.org/docs/), e.g. {"qpsol": "qrqp"} for sqpmethod, {"daqp": {"eps_prox": 1e-6}} or {"proxqp": {"eps_abs": 1e-9}}.
+        @return The CasADiSolver instance, so that setup can be chained after the constructor.
         """
         # Setup problem
         x = self.opt.decision_variables.vec()

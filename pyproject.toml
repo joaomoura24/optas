@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyoptas"
 version = "1.0.7"
-description = "An optimization-based task specification library for task and motion planning (TAMP), trajectory optimization, and model predictive control."
+description = "A light layer over CasADi for robot optimization: URDF kinematics, inverse kinematics, trajectory optimization and model predictive control."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

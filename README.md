@@ -4,7 +4,7 @@
 
 # OpTaS
 
-> **Note:** This repository is based on the original [cmower/optas](https://github.com/cmower/optas), but has significantly diverged from it.
+> **Note:** This repository is based on the original [cmower/optas](https://github.com/cmower/optas), but has significantly diverged from it (see the [changelog](CHANGELOG.md)).
 
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![CI](https://github.com/joaomoura24/optas/actions/workflows/ci.yaml/badge.svg)](https://github.com/joaomoura24/optas/actions/workflows/ci.yaml)
@@ -131,6 +131,24 @@ vis.start()
 Run the example script [example.py](example/example.py).
 Other examples, including dual-arm planning, Model Predictive Control, Trajectory Optimization, etc can be found in the [example/](example) directory.
 
+## Solvers
+
+`CasADiSolver(optimization).setup(solver_name, solver_options)` takes any QP (conic) or NLP solver plugin that CasADi has, with the plugin's options ([CasADi docs](https://web.casadi.org/docs/)):
+
+| Problem | Plugins (in the CasADi wheel) |
+|---|---|
+| Quadratic cost, linear constraints (QP) | `qpoases`, `qrqp`, `daqp`, `highs`, `proxqp`, `osqp` |
+| Nonlinear (NLP) | `ipopt`, `sqpmethod` (its QP solver is set with `{"qpsol": ...}`) |
+| Mixed-integer | `bonmin` |
+
+A QP can also be given to an NLP solver. Some plugins need options:
+
+- `daqp` fails when the Hessian is only positive semidefinite (e.g. slack variables with no cost) unless `{"daqp": {"eps_prox": 1e-6}}`.
+- `proxqp`'s default tolerance (`eps_abs` 1e-3) gives errors around 1e-2; use e.g. `{"proxqp": {"eps_abs": 1e-9}}`.
+- `osqp` does not load with CasADi 3.8.2 (its wheel reports "OSQP interface requires OSQP version >= 1.0.0"); it works with CasADi 3.7.
+
+`solver.violated_constraints(solution)` lists the constraints a solution violates, which helps to see why a solve failed.
+
 ## Code generation
 
 A problem solved with `CasADiSolver` can be turned into C and compiled (needs `gcc`), e.g. to call it from a C++ controller:
@@ -144,7 +162,7 @@ F = solver.to_function("ik", inputs=["p_goal"], outputs=[f"{name}/q/x"])
 library = solver.generate(F, "build")  # build/ik.c, build/ik.h, build/libik.so
 ```
 
-`to_function` returns a CasADi function that can also be called from Python. Load the library with `casadi.external("ik", library)`, or with `dlopen` through the CasADi C API in `ik.h`. CasADi can generate code for some solvers only (e.g. qrqp, daqp, highs; not qpoases, proxqp or ipopt).
+`to_function` returns a CasADi function that can also be called from Python. Load the library with `casadi.external("ik", library)`, or with `dlopen` through the CasADi C API in `ik.h`. CasADi can generate code for some solvers only (e.g. qrqp, daqp, highs; not qpoases, proxqp or ipopt). `sqpmethod` works well near the seed but can fail on IK with goals far from it, where `ipopt` is more robust.
 
 # Support
 
