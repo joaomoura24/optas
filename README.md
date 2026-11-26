@@ -153,12 +153,21 @@ Tested on Ubuntu 24.04 with Python 3.12 (see the [CI workflow](.github/workflows
 
 # Install
 
-Make sure `pip` is up-to-date by running `$ python -m pip install --upgrade pip`.
+Ubuntu's system Python does not allow `pip install` outside a virtual environment ([PEP 668](https://peps.python.org/pep-0668/)), so install OpTaS in one:
+
+```
+$ sudo apt install python3-venv
+$ python3 -m venv ~/.venvs/optas
+$ source ~/.venvs/optas/bin/activate
+(optas) $ python -m pip install --upgrade pip
+```
+
+Run the commands below, and any script that uses OpTaS, with the environment activated.
 
 ## Via pip
 
 ```
-$ python -m pip install 'pyoptas @ git+https://github.com/joaomoura24/optas.git'
+$ pip install 'pyoptas @ git+https://github.com/joaomoura24/optas.git'
 ```
 
 Note that `pip install pyoptas` installs the original upstream package from PyPI, not this version.
@@ -174,36 +183,32 @@ Optional features are available as extras, e.g. `'pyoptas[vis,solvers] @ git+...
 | `all` | all of the above | |
 
 ## From source
-1. `$ git clone --recursive https://github.com/joaomoura24/optas.git` (if you do not want to build the documentation then the `--recursive` flag is not necessary)
+
+1. `$ git clone --recursive https://github.com/joaomoura24/optas.git` (the `--recursive` flag is only needed to build the documentation)
 2. `$ cd optas`
-4. `$ pip install .` (or `$ pip install .[all]` for all optional features)
-   - if you want to run the examples use: `$ pip install .[example]`
-   - if you want to run the tests use: `$ pip install .[test]`
+3. `$ pip install .` (or `$ pip install '.[all]'` for all optional features)
+   - to run the examples: `$ pip install '.[example]'`
+   - to run the tests: `$ pip install '.[test]'`
+
+Add `-e` (e.g. `$ pip install -e '.[test]'`) to work on the code without reinstalling after each change.
 
 ### Build documentation
 
 1. `$ cd /path/to/optas/doc`
 2. `$ sudo apt install doxygen graphviz`
 3. `$ python gen_mainpage.py`
-3. `$ doxygen`
-4. Open the documentation in either HTML or PDF:
+4. `$ doxygen`
+5. Open the documentation in either HTML or PDF:
    - `html/index.html`
    - `latex/refman.pdf`
 
 ### Run tests
 
 1. `$ cd /path/to/optas`
-2. Each test can be run as follows
-   - `$ pytest tests/test_builder.py`
-   - `$ pytest tests/test_examples.py`
-   - `$ pytest tests/test_models.py`
-   - `$ pytest tests/test_optas_utils.py`
-   - `$ pytest tests/test_optimization.py`
-   - `$ pytest tests/test_solver.py`
-   - `$ pytest tests/test_spatialmath.py`
-   - `$ pytest tests/test_sx_container.py`
+2. `$ pytest tests` runs all tests; a single file can be run with e.g. `$ pytest tests/test_solver.py`
 
 Example tests that simulate in PyBullet are skipped unless it is installed (`$ pip install pybullet`).
+The code generation tests are skipped unless `gcc` is installed.
 
 # Known Issues
 
