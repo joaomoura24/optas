@@ -69,16 +69,6 @@ class TestSolverInterface(_SolverTester):
         with pytest.raises(ValueError):
             optas.CasADiSolver(self.setup_optimization()).setup("no_such_solver")
 
-    def test_osqp_interface(self):
-        opt = self.setup_optimization(True)  # OSQP fails for unconstrained
-        solver = optas.OSQPSolver(opt).setup(True)
-        self.solve_and_check_solution(solver)
-
-    def test_cvxopt_interface(self):
-        opt = self.setup_optimization()
-        solver = optas.CVXOPTSolver(opt).setup()
-        self.solve_and_check_solution(solver)
-
 
 def test_reset_layout():
     """reset_parameters/reset_initial_seed match SXContainer.dict2vec."""

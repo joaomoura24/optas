@@ -55,8 +55,7 @@ def main():
 
     # setup solver
     optimization = builder.build()
-    # solver = optas.CasADiSolver(optimization).setup('qpoases')
-    solver = optas.CVXOPTSolver(optimization).setup()
+    solver = optas.CasADiSolver(optimization).setup("qpoases")
     # set initial seed
     solver.reset_initial_seed({f"{robot_name}/dq/x": [0.0, 0.0, 0.0]})
     solver.reset_parameters({"q": q_t})

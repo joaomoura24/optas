@@ -163,12 +163,11 @@ $ python -m pip install 'pyoptas @ git+https://github.com/joaomoura24/optas.git'
 Note that `pip install pyoptas` installs the original upstream package from PyPI, not this version.
 
 The core install only needs CasADi, NumPy, SciPy, urdf-parser-py and PyYAML.
-Optional features are available as extras, e.g. `'pyoptas[vis,solvers] @ git+...'`:
+Optional features are available as extras, e.g. `'pyoptas[vis,xacro] @ git+...'`:
 
 | Extra | Adds | Needed for |
 |---|---|---|
 | `vis` | vtk | `optas.Visualizer` |
-| `solvers` | osqp, cvxopt | `OSQPSolver`, `CVXOPTSolver` |
 | `xacro` | xacro | loading models from xacro files |
 | `all` | all of the above | |
 
@@ -207,7 +206,6 @@ Example tests that simulate in PyBullet are skipped unless it is installed (`$ p
 # Known Issues
 
 - Loading robot models from xacro files is supported, however there can be issues if you are running this in a ROS agnositic environment. If you do not have ROS installed, then the xacro file should not contain ROS-specific features. For further details see [here](https://github.com/cmower/optas/issues/78).
-- If NumPy ver 1.24 is installed, an `AttributeError` error is thrown when you try to solve an unconstrained problem with the OSQP interface. A temporary workaround is to add a constraint, e.g. `x >= -1e9` where `x` is a decision variable. See details on the issue [here](https://github.com/osqp/osqp-python/issues/104) and pull request [here](https://github.com/osqp/osqp-python/pull/105).
 
 # Citation
 

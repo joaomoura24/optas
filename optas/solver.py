@@ -5,40 +5,17 @@ import casadi as cs
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from scipy.interpolate import interp1d
-from scipy.sparse import csc_matrix
 from .optimization import (
     Optimization,
-    QuadraticCostUnconstrained,
     QuadraticCostLinearConstraints,
     QuadraticCostNonlinearConstraints,
-    NonlinearCostUnconstrained,
     NonlinearCostLinearConstraints,
     NonlinearCostNonlinearConstraints,
     MixedIntegerNonlinearCostNonlinearConstrained,
 )
 from .models import RobotModel
 from .spatialmath import ArrayType, CasADiArrayType
-from typing import Dict, Tuple, List, Union, Optional
-
-## Optimization problem types with quadratic cost.
-QP_COST = {
-    QuadraticCostUnconstrained,
-    QuadraticCostLinearConstraints,
-    QuadraticCostNonlinearConstraints,
-}
-
-
-## Optimization problem types with nonlinear cost.
-NL_COST = {
-    NonlinearCostUnconstrained,
-    NonlinearCostLinearConstraints,
-    NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-}
-
-## Optimization problem types that are unconstrained.
-UNCONSTRAINED_OPT = {QuadraticCostUnconstrained, NonlinearCostUnconstrained}
-
+from typing import Dict, Tuple, List, Optional
 
 ## Optimization problem types that are constrained.
 CONSTRAINED_OPT = {
@@ -46,10 +23,6 @@ CONSTRAINED_OPT = {
     QuadraticCostNonlinearConstraints,
     NonlinearCostLinearConstraints,
     NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-}
-
-MIXED_INTEGER_OPT = {
     MixedIntegerNonlinearCostNonlinearConstrained,
 }
 
@@ -548,170 +521,3 @@ class CasADiSolver(Solver):
                 f"{sorted(self._solver_libs)}?):\n{result.stderr}"
             )
         return so_file
-
-
-################################################################
-# OSQP solver (https://osqp.org/)
-
-
-class OSQPSolver(Solver):
-    """OSQP solver interface."""
-
-    def setup(self, use_warm_start, settings: Optional[Dict] = None):
-        """! Setup solver.
-
-        @param use_warm_start When true, the initial seed x0 is used as a warm start. Default is True.
-        @param settings Settings that are passed to OSQP. Default is {}.
-        @return The instance of the solve (i.e. self).
-        """
-        assert self.opt_type in QP_COST, "OSQP cannot solve this type of problem"
-        import osqp  # optional dependency: pip install 'pyoptas[solvers]'
-
-        self._osqp = osqp
-        self.use_warm_start = use_warm_start
-        self._settings = dict(settings or {})
-        self._reset_parameters()
-        return self
-
-    def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
-        """! Reset the parameters.
-
-        @param p The values for the parameters.
-        """
-        super().reset_parameters(p)
-        self._reset_parameters()
-
-    def _reset_parameters(self) -> None:
-        """! Internal method to reset parameters."""
-        self._setup_input = {
-            **self._settings,
-            "P": csc_matrix(2.0 * self.opt.P(self._p).toarray()),
-            "q": self.opt.q(self._p).toarray().flatten(),
-        }
-        if self.opt_type in CONSTRAINED_OPT:
-            # M x + c >= 0 and A x + b = 0, i.e. l <= [M; A] x <= u
-            b = self.opt.b(self._p).toarray().flatten()
-            self._setup_input["A"] = csc_matrix(
-                cs.vertcat(self.opt.M(self._p), self.opt.A(self._p)).toarray()
-            )
-            self._setup_input["l"] = np.concatenate(
-                [-self.opt.c(self._p).toarray().flatten(), -b]
-            )
-            self._setup_input["u"] = np.concatenate([np.full(self.opt.nk, np.inf), -b])
-
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem using OSQP.
-
-        @return The solution of the optimization problem.
-        """
-
-        # Setup solver
-        self.m = self._osqp.OSQP()
-        self.m.setup(**self._setup_input)
-
-        # Warm start optimization
-        if self.use_warm_start:
-            self.m.warm_start(x=self._x0)
-
-        # Solve problem
-        self._solution = self.m.solve()
-
-        return self._solution.x
-
-    def stats(self):
-        """! Statistics for the solution given by OSQP.
-
-        @return Statistics returned by OSQP. See details at https://osqp.org/.
-        """
-        return self._solution
-
-    def did_solve(self) -> bool:
-        """! Returns True when the problem was solved.
-
-        @return Boolean indicating if the solver converged.
-        """
-        return self._solution.info.status == "solved"
-
-    def number_of_iterations(self) -> int:
-        """! Number of iterations it took the solver to converge.
-
-        @return Number of iterations.
-        """
-        return self._solution.info.iter
-
-
-################################################################
-# CVXOPT QP solver (https://cvxopt.org/)
-
-
-class CVXOPTSolver(Solver):
-    """! CVXOPT solver interface."""
-
-    def setup(self, solver_settings: Optional[Dict] = None):
-        """! Setup the cvxopt solver interface.
-
-        @param solver_settings Settings passed to the CVXOPT solver.
-        @return The instance of the solve (i.e. self).
-        """
-        assert self.opt_type in QP_COST, "CVXOPT cannot solve this problem"
-        import cvxopt  # optional dependency: pip install 'pyoptas[solvers]'
-
-        self._cvxopt = cvxopt
-
-        ## Input to the solver
-        self._solver_input = dict(solver_settings or {})
-
-        self._reset_parameters()
-        return self
-
-    def reset_parameters(self, p: Dict[str, ArrayType]):
-        """! Reset the parameters.
-
-        @param p The values for the parameters.
-        """
-        super().reset_parameters(p)
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        """! Internal method to reset parameters."""
-        cvxopt = self._cvxopt
-        self._solver_input["P"] = cvxopt.matrix(2.0 * self.opt.P(self._p).toarray())
-        self._solver_input["q"] = cvxopt.matrix(self.opt.q(self._p).toarray().flatten())
-        if self.opt_type in CONSTRAINED_OPT:
-            if self.opt.nk > 0:
-                self._solver_input["G"] = cvxopt.matrix(-self.opt.M(self._p).toarray())
-                self._solver_input["h"] = cvxopt.matrix(
-                    self.opt.c(self._p).toarray().flatten()
-                )
-            if self.opt.na > 0:
-                self._solver_input["A"] = cvxopt.matrix(self.opt.A(self._p).toarray())
-                self._solver_input["b"] = cvxopt.matrix(-self.opt.b(self._p).toarray())
-
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem using CVXOPT.
-
-        @return The solution of the optimization problem.
-        """
-        self._solution = self._cvxopt.solvers.qp(**self._solver_input)
-        return self._solution["x"]
-
-    def stats(self):
-        """! Statistics relating to the previous call to solve.
-
-        @return Dictionary containing the statistics.
-        """
-        return self._solution
-
-    def did_solve(self):
-        """! Returns True when the problem was solved.
-
-        @return Boolean indicating if the solver converged.
-        """
-        return self._solution["status"] == "optimal"
-
-    def number_of_iterations(self):
-        """! Number of iterations it took the solver to converge.
-
-        @return Number of iterations.
-        """
-        return self._solution["iterations"]

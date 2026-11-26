@@ -51,6 +51,6 @@ The task-space consists of the x and y position of the end-effector and the IK c
 ### Planar IDK
 
 The `planar_idk.py` script contains a simple example of a possible Inverse Differential Kinematics (IDK) implementation for a planar three DoF robot arm.
-The task-space consists of a desired displacement of the x and y position of the end-effector and the IDK computes the optimal set of joint angle displacements, using two different alternative Quadratic Program (QP) solvers.
+The task-space consists of a desired displacement of the x and y position of the end-effector and the IDK computes the optimal set of joint angle displacements as a Quadratic Program (QP) solved with `CasADiSolver` (qpOASES).
 This formulation also adds bounds to the end-effector orientation and compares the result with the solution obtained through the pseudo-inverse approach.
 
