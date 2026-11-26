@@ -1,7 +1,6 @@
-# OpTaS Examples and Experiments
+# OpTaS Examples
 
 Several examples are contained in this directory.
-In addition, two experiments are also included.
 
 The majority of these examples require [PyBullet](https://pybullet.org/wordpress/), and some use the OpTaS visualizer, which requires [VTK](https://vtk.org/).
 Install everything the examples need with `$ pip install .[example]` from the repository root.
@@ -47,35 +46,11 @@ This example, in the script `point_mass_planner.py`, demonstrates how to plan a 
 ### Planar IK
 
 The `planar_ik.py` script contains a simple example of a possible full Inverse Kinematics (IK) implementation for a planar three Degrees of Freedom (DoF) robot arm.
-The task-space consists of the x and y position of the end-effector and the IK computes an optimal set of joint angles, using a non-linear program formulation through the CassADiSolver and the ScipyMinimizeSolver interfaces.
+The task-space consists of the x and y position of the end-effector and the IK computes an optimal set of joint angles, using a non-linear program formulation solved with `CasADiSolver` (IPOPT).
 
 ### Planar IDK
 
 The `planar_idk.py` script contains a simple example of a possible Inverse Differential Kinematics (IDK) implementation for a planar three DoF robot arm.
-The task-space consists of a desired displacement of the x and y position of the end-effector and the IDK computes the optimal set of joint angle displacements, using two different alternative Quadratic Program (QP) solvers.
+The task-space consists of a desired displacement of the x and y position of the end-effector and the IDK computes the optimal set of joint angle displacements as a Quadratic Program (QP) solved with `CasADiSolver` (qpOASES).
 This formulation also adds bounds to the end-effector orientation and compares the result with the solution obtained through the pseudo-inverse approach.
 
-## Experiments
-
-### Experiment 1
-
-Assuming PyBullet is installed, this experiment should run out of the box.
-
-### Experiment 2
-
-This experiment requires some additional setup to run.
-Ultimately, it requires [TracIK](https://traclabs.com/projects/trac-ik/) and [EXOTica](https://github.com/ipab-slmc/exotica).
-The easiest way to install these and run the experiment is to follow these instructions.
-
-1. [Install ROS Noetic (full install)](http://wiki.ros.org/noetic/Installation/Ubuntu)
-2. [Install catkin_tools](https://catkin-tools.readthedocs.io/en/latest/)
-3. Create catkin workspace and `src` directory: `$ mkdir -p optas_expr_ws/src && cd optas_expr_ws`
-4. Initialize catkin workspace: `$ catkin init`
-5. Change directory: `$ cd src`
-6. Clone EXOTica: `$ git clone git@github.com:ipab-slmc/exotica.git`
-7. Clone TracIK: `$ git clone https://bitbucket.org/traclabs/trac_ik.git`
-8. Install dependencies: `$ rosdep update ; rosdep install --from-paths ./ -iry`
-9. Build catkin workspace: `$ catkin build`
-10. Source catkin workspace: `$ source ../devel/setup.bash`
-11. Change directory: `$ cd /path/to/optas/example`
-12. Run experiment: `$ python experiment2.py` (**note**: since EXOTica loads URDF/SRDF files using relative filenames to where the load methods are called, you must ensure to run this script from inside the `example/` directory - this doesn't apply for the other examples)

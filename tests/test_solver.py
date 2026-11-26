@@ -69,39 +69,6 @@ class TestSolverInterface(_SolverTester):
         with pytest.raises(ValueError):
             optas.CasADiSolver(self.setup_optimization()).setup("no_such_solver")
 
-    def test_osqp_interface(self):
-        opt = self.setup_optimization(True)  # OSQP fails for unconstrained
-        solver = optas.OSQPSolver(opt).setup(True)
-        self.solve_and_check_solution(solver)
-
-    def test_cvxopt_interface(self):
-        opt = self.setup_optimization()
-        solver = optas.CVXOPTSolver(opt).setup()
-        self.solve_and_check_solution(solver)
-
-    def test_scipy_minimize_interface(self):
-        solver_names = [
-            "Nelder-Mead",
-            "Powell",
-            "CG",
-            "BFGS",
-            "Newton-CG",
-            "L-BFGS-B",
-            "TNC",
-            "COBYLA",
-            "SLSQP",
-            "trust-constr",
-            "dogleg",
-            "trust-ncg",
-            "trust-exact",
-            "trust-krylov",
-        ]
-
-        for solver_name in solver_names:
-            opt = self.setup_optimization()
-            solver = optas.ScipyMinimizeSolver(opt).setup(method=solver_name, tol=1e-6)
-            self.solve_and_check_solution(solver, solver_name)
-
 
 def test_reset_layout():
     """reset_parameters/reset_initial_seed match SXContainer.dict2vec."""
@@ -203,7 +170,6 @@ class TestBoundedConstraints:
         opt = builder.build()
         # one row per equality and bound; a bound that uses x is two rows
         assert opt.ncon == 1 + 2 + 1 + 2
-        assert opt.nv == 2 + 4 + 1 + 2  # v(x, p) >= 0 form, unchanged
 
     @pytest.mark.parametrize(
         "solver_name", ["qpoases", "qrqp"] + ["daqp"] * cs.has_conic("daqp")
@@ -222,3 +188,47 @@ class TestBoundedConstraints:
         # and as inputs of to_function
         F = solver.to_function("F", inputs=["hi"])
         assert isclose(F([0.2, 1.0]), [0.2, 0.8])
+
+
+class TestEvaluate:
+    @staticmethod
+    def solver():
+        builder, x = TestBoundedConstraints.build()
+        builder.add_cost_term("g", 2.0 * x[0])
+        solver = optas.CasADiSolver(builder.build()).setup("qpoases")
+        solver.reset_parameters({"lo": [-1.0, -1.0], "hi": [1.0, 1.0], "t": 1.0})
+        return solver
+
+    def test_violated_constraints(self):
+        solver = self.solver()
+        assert solver.violated_constraints({"x": [0.5, 0.5]}) == []
+
+        # x0 above its upper bound; the sum is still 1, so only the box is violated
+        (vc,) = solver.violated_constraints({"x": [1.5, -0.5]})
+        assert vc.label == "box"
+        assert isclose(vc.lower, [-1.0, -1.0])
+        assert isclose(vc.value, [1.5, -0.5])
+        assert isclose(vc.upper, [1.0, 1.0])
+        assert isclose(vc.violation, [0.5, 0.0])
+        assert "box" in str(vc)
+
+        # an equality is violated on either side, within tol it is not
+        for value in ([0.2, 0.2], [0.9, 0.9]):
+            assert [v.label for v in solver.violated_constraints({"x": value})] == [
+                "sum"
+            ]
+        assert solver.violated_constraints({"x": [0.5, 0.5 + 1e-8]}) == []
+
+        # parameters given explicitly instead of the ones set by reset_parameters
+        p = {"lo": [-1.0, -1.0], "hi": [2.0, 1.0], "t": 1.0}
+        assert solver.violated_constraints({"x": [1.5, -0.5]}, p) == []
+
+    def test_evaluate_cost(self):
+        solver = self.solver()
+        x = {"x": [2.0, 3.0]}
+        terms = solver.evaluate_cost_terms(x)
+        assert list(terms) == ["f", "g"]
+        assert isclose(terms["f"], 1.0 + 4.0)
+        assert isclose(terms["g"], 4.0)
+        assert isclose(solver.evaluate_cost(x), 9.0)
+        assert isclose(solver.evaluate_cost(x, {"t": 0.0}), 4.0 + 9.0 + 4.0)

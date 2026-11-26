@@ -3,59 +3,14 @@ import subprocess
 import numpy as np
 import casadi as cs
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
 from scipy.interpolate import interp1d
-from scipy.optimize import minimize, NonlinearConstraint, LinearConstraint
-from scipy.sparse import csc_matrix
-from .optimization import (
-    Optimization,
-    QuadraticCostUnconstrained,
-    QuadraticCostLinearConstraints,
-    QuadraticCostNonlinearConstraints,
-    NonlinearCostUnconstrained,
-    NonlinearCostLinearConstraints,
-    NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-)
+from .optimization import Optimization
 from .models import RobotModel
 from .spatialmath import ArrayType, CasADiArrayType
-from typing import Dict, Tuple, List, Union, Optional
-
-## Optimization problem types with quadratic cost.
-QP_COST = {
-    QuadraticCostUnconstrained,
-    QuadraticCostLinearConstraints,
-    QuadraticCostNonlinearConstraints,
-}
-
-
-## Optimization problem types with nonlinear cost.
-NL_COST = {
-    NonlinearCostUnconstrained,
-    NonlinearCostLinearConstraints,
-    NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-}
-
-## Optimization problem types that are unconstrained.
-UNCONSTRAINED_OPT = {QuadraticCostUnconstrained, NonlinearCostUnconstrained}
-
-
-## Optimization problem types that are constrained.
-CONSTRAINED_OPT = {
-    QuadraticCostLinearConstraints,
-    QuadraticCostNonlinearConstraints,
-    NonlinearCostLinearConstraints,
-    NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-}
-
-MIXED_INTEGER_OPT = {
-    MixedIntegerNonlinearCostNonlinearConstrained,
-}
+from typing import Dict, Tuple, List, Optional
 
 ################################################################
-# Solver base class
+# Helpers
 
 
 def _pack(buf: np.ndarray, layout: Dict, values: Dict[str, ArrayType]) -> None:
@@ -86,15 +41,41 @@ def _unpack(vec: ArrayType, layout: Dict) -> Dict[str, cs.DM]:
     return out
 
 
-class Solver(ABC):
-    """! Base solver interface class"""
+@dataclass
+class ViolatedConstraint:
+    """! A constraint lower <= value <= upper that is violated (see CasADiSolver.violated_constraints).
+
+    The arrays have one element per constraint element (column-major for matrices).
+    """
+
+    label: str
+    lower: np.ndarray
+    value: np.ndarray
+    upper: np.ndarray
+
+    @property
+    def violation(self) -> np.ndarray:
+        """! How far each element is outside its bounds (zero when inside)."""
+        return np.maximum(
+            np.maximum(self.lower - self.value, self.value - self.upper), 0
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"{self.label}: max violation {self.violation.max():.3g}\n"
+            f"  lower {self.lower}\n  value {self.value}\n  upper {self.upper}"
+        )
+
+
+class CasADiSolver:
+    """! Solves an optimization problem with a CasADi QP (conic) or NLP solver plugin."""
 
     def __init__(self, optimization: Optimization, error_on_fail: bool = False):
-        """! Constructor for the base Solver class.
+        """! Constructor for the CasADiSolver class, call setup next.
 
         @param optimization The optimization problem created by calling the build method of the OptimizationBuilder class.
         @param error_on_fail When True, after solve() is called, if the solver did not converge then a RuntimeError is thrown. Default is False.
-        @return An instance of the Solver class.
+        @return An instance of the CasADiSolver class.
         """
 
         ## Instance of the optimization problem.
@@ -114,258 +95,21 @@ class Solver(ABC):
         ## Solution container
         self._solution = None
 
-    @property
-    def opt_type(self) -> type:
-        """! Optimization type.
+        ## Statistics of the last solve, fetched from the solver when first asked for.
+        self._stats = None
 
-        @return The type of the optimization problem.
-        """
-        return type(self.opt)
-
-    @abstractmethod
-    def setup(self, *args, **kwargs):
-        """! Setup solver, note this method must return self. This is an abstract method."""
-        pass
-
-    @property
-    def x0(self) -> cs.DM:
-        """! Initial guess for the optimization problem (set using reset_initial_seed)."""
-        return cs.DM(self._x0)
-
-    @property
-    def p(self) -> cs.DM:
-        """! Parameter vector (set using reset_parameters)."""
-        return cs.DM(self._p)
-
-    def reset_initial_seed(self, x0: Dict[str, ArrayType]) -> None:
-        """! Reset initial seed for the optimization problem.
-
-        @param x0 The initial seed.
-        """
-        _pack(self._x0, self._x_layout, x0)
-
-    def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
-        """! Reset the parameters for the optimization problem.
-
-        @param p Specifies the parameters.
-        """
-        _pack(self._p, self._p_layout, p)
-
-    @abstractmethod
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem and return the optimal decision variables as an array. This is an abstract method.
-
-        @return The solution from the solver.
-        """
-        pass
-
-    def solve(self) -> Dict:
-        """! Solve the optimization problem.
-
-        @return A dictionary containing the solution.
-        """
-        solution = _unpack(self._solve(), self._x_layout)
-        p_dict = None  # parameter dictionary, only built if a model needs it
-
-        if self._error_on_fail and (not self.did_solve()):
-            raise RuntimeError("Solver failed!")
-
-        # Add full model state to the solution dictionary
-        for model in self.opt.models:
-            for d in model.time_derivs:
-                n_s = model.state_name(d)
-                n_s_x = model.state_optimized_name(d)
-                if isinstance(model, RobotModel):
-                    if model.num_param_joints > 0:
-                        n_s_p = model.state_parameter_name(d)
-                        t = solution[n_s_x].shape[1]
-                        solution[n_s] = cs.DM.zeros(model.dim, t)
-                        solution[n_s][model.optimized_joint_indexes, :] = solution[
-                            n_s_x
-                        ]
-                        if p_dict is None:
-                            p_dict = _unpack(self._p, self._p_layout)
-                        solution[n_s][model.parameter_joint_indexes, :] = p_dict[n_s_p]
-                    else:
-                        solution[n_s] = solution[n_s_x]
-                else:
-                    solution[n_s] = solution[n_s_x]
-
-        return solution
-
-    @abstractmethod
-    def stats(self):
-        """! Return stats from solver. The return type is specifc to the solver used. This is an abstract method.
-
-        @return The statistics returned by the solver. This is specified to the solver used.
-        """
-        pass
-
-    def violated_constraints(
-        self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
-    ) -> Tuple:
-        """! Indicate the violated constraints.
-
-        @param x The values for the decision variables.
-        @param p The values for the parameters.
-        @return Several lists that contain information regarding which constraints are violated.
-        """
-        x = self.opt.decision_variables.dict2vec(x)
-        p = self.opt.parameters.dict2vec(p)
-
-        @dataclass
-        class ViolatedConstraint:
-            label: str
-            ctype: str
-            diff: cs.DM
-            pattern: cs.DM
-
-            def __str__(self):
-                return f"\n{self.label} [{self.ctype}]:\n{self.pattern}\n"
-
-            def __repr__(self):
-                info = str(self)
-                max_width = max(len(line) for line in info.split("\n"))
-                return "=" * max_width + info + "-" * max_width + "\n"
-
-            @property
-            def verbose_info(self):
-                info = str(self)
-                info += f"{self.diff}\n"
-                return info
-
-        lin_eq_violated_constraints = []
-        for label, sx_var in self.opt.lin_eq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            lin_eq_violated_constraints.append(
-                ViolatedConstraint(label, "lin_eq", diff, diff >= 0.0)
-            )
-
-        eq_violated_constraints = []
-        for label, sx_var in self.opt.eq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            eq_violated_constraints.append(
-                ViolatedConstraint(label, "eq", diff, diff >= 0.0)
-            )
-
-        lin_ineq_violated_constraints = []
-        for label, sx_var in self.opt.lin_ineq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            lin_ineq_violated_constraints.append(
-                ViolatedConstraint(label, "lin_ineq", diff, diff >= 0.0)
-            )
-
-        ineq_violated_constraints = []
-        for label, sx_var in self.opt.ineq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            ineq_violated_constraints.append(
-                ViolatedConstraint(label, "ineq", diff, diff >= 0.0)
-            )
-
-        return (
-            lin_eq_violated_constraints,
-            eq_violated_constraints,
-            lin_ineq_violated_constraints,
-            ineq_violated_constraints,
-        )
-
-    @staticmethod
-    def interpolate(traj: cs.DM, T: float, **interp_args) -> interp1d:
-        """! Interpolate a trajectory
-
-        @param traj The trajectory to be interpolated where the columns correspond to the states over time.
-        @param T The time duration of the trajectory.
-        @return An interpolated function.
-        """
-        assert isinstance(
-            traj, cs.DM
-        ), f"traj is incorrect type, got '{type(traj)}', expected casadi.DM'"
-        t = np.linspace(0, T, traj.shape[1])
-        return interp1d(t, traj.toarray(), **interp_args)
-
-    @abstractmethod
-    def did_solve(self) -> bool:
-        """! Returns true when the solver solved the previous problem, false otherwise. This is an abstract method.
-
-        @return Result of whether the solver succeeded or not.
-        """
-        pass
-
-    @abstractmethod
-    def number_of_iterations(self) -> int:
-        """! Returns the number of iterations required to solve the problem. This is an abstract method.
-
-        @return Number of iterations.
-        """
-        pass
-
-    def evaluate_cost(
-        self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
-    ) -> CasADiArrayType:
-        """! Evaluates the cost function for given decision variables x and parameters p.
-
-        @param x The values for the decision variables.
-        @param p The values for the parameters.
-        @return The cost that results from x and p.
-        """
-        x = self.opt.decision_variables.dict2vec(x)
-        p = self.opt.parameters.dict2vec(p)
-        return self.opt.f(x, p)
-
-    def evaluate_cost_terms(
-        self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
-    ) -> List:
-        """! Evaluates each cost term for given decision variables and parameters.
-
-        @param x The values for the decision variables.
-        @param p The values for the parameters.
-        @return List corresponding to each cost term evalauted at x, p.
-        """
-
-        x = self.opt.decision_variables.dict2vec(x)
-        p = self.opt.parameters.dict2vec(p)
-
-        @dataclass
-        class CostTerm:
-            label: str
-            cost: float
-
-            def __str__(self):
-                return f"\n{self.label}: {self.cost}"
-
-            def __repr__(self):
-                info = str(self)
-                max_width = max(len(line) for line in info.split("\n"))
-                return "=" * max_width + info + "-" * max_width + "\n"
-
-        cost_terms = []
-        for label, sx_var in self.opt.cost_terms.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            c = fun(x, p)
-            cost_terms.append(c)
-
-        return cost_terms
-
-
-################################################################
-# CasADi solvers (https://web.casadi.org/)
-
-
-class CasADiSolver(Solver):
-    """! This is a base class for CasADi solver interfaces."""
+        # Bounds of the constraint rows, set in setup
+        self._bounds = None
+        self._bounds_p_index = np.zeros(0, dtype=int)
+        self._rows = None  # functions built on first use of violated_constraints
+        self._cost_terms = None  # and evaluate_cost_terms
 
     def setup(self, solver_name: str, solver_options: Optional[Dict] = None):
         """! Setup the optimization solver.
 
         @param solver_name The name of the solver to be used: any QP (conic) or NLP solver plugin available in CasADi, e.g. qpoases, osqp, daqp, proxqp, qrqp, highs, ipopt, bonmin, sqpmethod. Mixed-integer problems need an NLP solver that supports them (e.g. bonmin).
-        @param solver_options Solver options passed to the solver. For details, see
-            - https://casadi.sourceforge.net/v3.0.0/api/html/d9/d37/group__qpsol.html, and
-            - https://casadi.sourceforge.net/v2.0.0/api/html/d6/d07/classcasadi_1_1NlpSolver.html
-        @return An instance of the CasADiSovler class.
+        @param solver_options Options passed to the CasADi plugin (see https://web.casadi.org/docs/), e.g. {"qpsol": "qrqp"} for sqpmethod, {"daqp": {"eps_prox": 1e-6}} or {"proxqp": {"eps_abs": 1e-9}}.
+        @return The CasADiSolver instance, so that setup can be chained after the constructor.
         """
         # Setup problem
         x = self.opt.decision_variables.vec()
@@ -381,9 +125,7 @@ class CasADiSolver(Solver):
         # Setup constraints
 
         # Constraints lbg(p) <= g(x, p) <= ubg(p): one row per equality or bound
-        self._bounds = None
-        self._bounds_p_index = np.zeros(0, dtype=int)  # entries of p the bounds use
-        if self.opt_type in CONSTRAINED_OPT:
+        if self.opt.ncon > 0:
             problem["g"] = cs.cse(self.opt.con(x, p))
             lbg, ubg = self.opt.lbcon(p), self.opt.ubcon(p)
             self._bounds = cs.Function("bounds", [p], [lbg, ubg])
@@ -421,14 +163,31 @@ class CasADiSolver(Solver):
 
         return self
 
+    @property
+    def x0(self) -> cs.DM:
+        """! Initial guess for the optimization problem (set using reset_initial_seed)."""
+        return cs.DM(self._x0)
+
+    @property
+    def p(self) -> cs.DM:
+        """! Parameter vector (set using reset_parameters)."""
+        return cs.DM(self._p)
+
+    def reset_initial_seed(self, x0: Dict[str, ArrayType]) -> None:
+        """! Reset initial seed for the optimization problem.
+
+        @param x0 The initial seed.
+        """
+        _pack(self._x0, self._x_layout, x0)
+
     def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
         """! Reset the parameters for the optimization problem.
 
         @param p Specifies the parameters.
         """
-        super().reset_parameters(p)
-        index = getattr(self, "_bounds_p_index", None)
-        if index is not None and index.size > 0:
+        _pack(self._p, self._p_layout, p)
+        index = self._bounds_p_index
+        if index.size > 0:
             if not np.array_equal(self._p[index], self._bounds_p):
                 self._bounds_p = self._p[index]
                 self._lbg, self._ubg = self._bounds(self._p)
@@ -439,12 +198,46 @@ class CasADiSolver(Solver):
         @return Solution to the problem.
         """
         solver_input = {"x0": self._x0, "p": self._p}
-        if self.opt_type in CONSTRAINED_OPT:
+        if self.opt.ncon > 0:
             solver_input["lbg"] = self._lbg
             solver_input["ubg"] = self._ubg
         self._solution = self._solver(**solver_input)
         self._stats = None  # fetched from the solver when first asked for
         return self._solution["x"]
+
+    def solve(self) -> Dict:
+        """! Solve the optimization problem.
+
+        @return A dictionary containing the solution.
+        """
+        solution = _unpack(self._solve(), self._x_layout)
+        p_dict = None  # parameter dictionary, only built if a model needs it
+
+        if self._error_on_fail and (not self.did_solve()):
+            raise RuntimeError("Solver failed!")
+
+        # Add full model state to the solution dictionary
+        for model in self.opt.models:
+            for d in model.time_derivs:
+                n_s = model.state_name(d)
+                n_s_x = model.state_optimized_name(d)
+                if isinstance(model, RobotModel):
+                    if model.num_param_joints > 0:
+                        n_s_p = model.state_parameter_name(d)
+                        t = solution[n_s_x].shape[1]
+                        solution[n_s] = cs.DM.zeros(model.dim, t)
+                        solution[n_s][model.optimized_joint_indexes, :] = solution[
+                            n_s_x
+                        ]
+                        if p_dict is None:
+                            p_dict = _unpack(self._p, self._p_layout)
+                        solution[n_s][model.parameter_joint_indexes, :] = p_dict[n_s_p]
+                    else:
+                        solution[n_s] = solution[n_s_x]
+                else:
+                    solution[n_s] = solution[n_s_x]
+
+        return solution
 
     def stats(self) -> Dict:
         """! Statistics relating to the previous call to solve.
@@ -469,6 +262,99 @@ class CasADiSolver(Solver):
         @return Number of iterations.
         """
         return self.stats()["iter_count"]
+
+    def _vectors(
+        self, x: Dict[str, ArrayType], p: Optional[Dict[str, ArrayType]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """! Vectorize x and p (when p is None, the parameters set by reset_parameters)."""
+        xv = np.zeros(self.opt.nx)
+        _pack(xv, self._x_layout, x)
+        if p is None:
+            return xv, self._p
+        pv = np.zeros(self.opt.np)
+        _pack(pv, self._p_layout, p)
+        return xv, pv
+
+    def violated_constraints(
+        self,
+        x: Dict[str, ArrayType],
+        p: Optional[Dict[str, ArrayType]] = None,
+        tol: float = 1e-6,
+    ) -> List["ViolatedConstraint"]:
+        """! Return the constraints that x violates, e.g. to see why a solve failed.
+
+        A constraint is violated when any of its elements is outside
+        [lower - tol, upper + tol].
+
+        @param x The values for the decision variables, e.g. the dictionary returned by solve.
+        @param p The values for the parameters. Default: the parameters set by reset_parameters.
+        @param tol Tolerance on the bounds.
+        @return List of ViolatedConstraint, in the order the constraints were added.
+        """
+        if self._rows is None:
+            outputs = []
+            for lower, expression, upper in self.opt.constraint_rows.values():
+                ones = cs.DM.ones(*expression.shape)
+                outputs += [
+                    cs.vec(lower * ones),
+                    cs.vec(expression),
+                    cs.vec(upper * ones),
+                ]
+            self._rows = cs.Function("rows", [self.opt.x, self.opt.p], outputs)
+
+        values = self._rows(*self._vectors(x, p))
+        violated = []
+        for i, label in enumerate(self.opt.constraint_rows):
+            lower, value, upper = [
+                np.asarray(v).flatten() for v in values[3 * i : 3 * i + 3]
+            ]
+            if np.any(value < lower - tol) or np.any(value > upper + tol):
+                violated.append(ViolatedConstraint(label, lower, value, upper))
+        return violated
+
+    def evaluate_cost(
+        self, x: Dict[str, ArrayType], p: Optional[Dict[str, ArrayType]] = None
+    ) -> float:
+        """! Evaluate the cost function.
+
+        @param x The values for the decision variables.
+        @param p The values for the parameters. Default: the parameters set by reset_parameters.
+        @return The cost at x and p.
+        """
+        return float(self.opt.f(*self._vectors(x, p)))
+
+    def evaluate_cost_terms(
+        self, x: Dict[str, ArrayType], p: Optional[Dict[str, ArrayType]] = None
+    ) -> Dict[str, float]:
+        """! Evaluate each cost term.
+
+        @param x The values for the decision variables.
+        @param p The values for the parameters. Default: the parameters set by reset_parameters.
+        @return Dictionary of the value of each cost term, by label.
+        """
+        if self._cost_terms is None:
+            terms = self.opt.cost_terms
+            self._cost_terms = cs.Function(
+                "cost_terms", [self.opt.x, self.opt.p], list(terms.values())
+            )
+        values = self._cost_terms(*self._vectors(x, p))
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        return {label: float(v) for label, v in zip(self.opt.cost_terms, values)}
+
+    @staticmethod
+    def interpolate(traj: cs.DM, T: float, **interp_args) -> interp1d:
+        """! Interpolate a trajectory
+
+        @param traj The trajectory to be interpolated where the columns correspond to the states over time.
+        @param T The time duration of the trajectory.
+        @return An interpolated function.
+        """
+        assert isinstance(
+            traj, cs.DM
+        ), f"traj is incorrect type, got '{type(traj)}', expected casadi.DM'"
+        t = np.linspace(0, T, traj.shape[1])
+        return interp1d(t, traj.toarray(), **interp_args)
 
     def to_function(
         self,
@@ -497,7 +383,7 @@ class CasADiSolver(Solver):
             ]
         )
         solver_input = {"x0": self._x0, "p": p}
-        if self.opt_type in CONSTRAINED_OPT:
+        if self.opt.ncon > 0:
             solver_input["lbg"], solver_input["ubg"] = self._bounds(p)
         x = self._solver(**solver_input)["x"]
         res = [
@@ -549,402 +435,3 @@ class CasADiSolver(Solver):
                 f"{sorted(self._solver_libs)}?):\n{result.stderr}"
             )
         return so_file
-
-
-################################################################
-# OSQP solver (https://osqp.org/)
-
-
-class OSQPSolver(Solver):
-    """OSQP solver interface."""
-
-    def setup(self, use_warm_start, settings: Optional[Dict] = None):
-        """! Setup solver.
-
-        @param use_warm_start When true, the initial seed x0 is used as a warm start. Default is True.
-        @param settings Settings that are passed to OSQP. Default is {}.
-        @return The instance of the solve (i.e. self).
-        """
-        assert self.opt_type in QP_COST, "OSQP cannot solve this type of problem"
-        import osqp  # optional dependency: pip install 'pyoptas[solvers]'
-
-        self._osqp = osqp
-        self.use_warm_start = use_warm_start
-        self._settings = dict(settings or {})
-        self._reset_parameters()
-        return self
-
-    def reset_parameters(self, p: Dict[str, ArrayType]) -> None:
-        """! Reset the parameters.
-
-        @param p The values for the parameters.
-        """
-        super().reset_parameters(p)
-        self._reset_parameters()
-
-    def _reset_parameters(self) -> None:
-        """! Internal method to reset parameters."""
-        self._setup_input = {
-            **self._settings,
-            "P": csc_matrix(2.0 * self.opt.P(self._p).toarray()),
-            "q": self.opt.q(self._p).toarray().flatten(),
-        }
-        if self.opt_type in CONSTRAINED_OPT:
-            # M x + c >= 0 and A x + b = 0, i.e. l <= [M; A] x <= u
-            b = self.opt.b(self._p).toarray().flatten()
-            self._setup_input["A"] = csc_matrix(
-                cs.vertcat(self.opt.M(self._p), self.opt.A(self._p)).toarray()
-            )
-            self._setup_input["l"] = np.concatenate(
-                [-self.opt.c(self._p).toarray().flatten(), -b]
-            )
-            self._setup_input["u"] = np.concatenate([np.full(self.opt.nk, np.inf), -b])
-
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem using OSQP.
-
-        @return The solution of the optimization problem.
-        """
-
-        # Setup solver
-        self.m = self._osqp.OSQP()
-        self.m.setup(**self._setup_input)
-
-        # Warm start optimization
-        if self.use_warm_start:
-            self.m.warm_start(x=self._x0)
-
-        # Solve problem
-        self._solution = self.m.solve()
-
-        return self._solution.x
-
-    def stats(self):
-        """! Statistics for the solution given by OSQP.
-
-        @return Statistics returned by OSQP. See details at https://osqp.org/.
-        """
-        return self._solution
-
-    def did_solve(self) -> bool:
-        """! Returns True when the problem was solved.
-
-        @return Boolean indicating if the solver converged.
-        """
-        return self._solution.info.status == "solved"
-
-    def number_of_iterations(self) -> int:
-        """! Number of iterations it took the solver to converge.
-
-        @return Number of iterations.
-        """
-        return self._solution.info.iter
-
-
-################################################################
-# CVXOPT QP solver (https://cvxopt.org/)
-
-
-class CVXOPTSolver(Solver):
-    """! CVXOPT solver interface."""
-
-    def setup(self, solver_settings: Optional[Dict] = None):
-        """! Setup the cvxopt solver interface.
-
-        @param solver_settings Settings passed to the CVXOPT solver.
-        @return The instance of the solve (i.e. self).
-        """
-        assert self.opt_type in QP_COST, "CVXOPT cannot solve this problem"
-        import cvxopt  # optional dependency: pip install 'pyoptas[solvers]'
-
-        self._cvxopt = cvxopt
-
-        ## Input to the solver
-        self._solver_input = dict(solver_settings or {})
-
-        self._reset_parameters()
-        return self
-
-    def reset_parameters(self, p: Dict[str, ArrayType]):
-        """! Reset the parameters.
-
-        @param p The values for the parameters.
-        """
-        super().reset_parameters(p)
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        """! Internal method to reset parameters."""
-        cvxopt = self._cvxopt
-        self._solver_input["P"] = cvxopt.matrix(2.0 * self.opt.P(self._p).toarray())
-        self._solver_input["q"] = cvxopt.matrix(self.opt.q(self._p).toarray().flatten())
-        if self.opt_type in CONSTRAINED_OPT:
-            if self.opt.nk > 0:
-                self._solver_input["G"] = cvxopt.matrix(-self.opt.M(self._p).toarray())
-                self._solver_input["h"] = cvxopt.matrix(
-                    self.opt.c(self._p).toarray().flatten()
-                )
-            if self.opt.na > 0:
-                self._solver_input["A"] = cvxopt.matrix(self.opt.A(self._p).toarray())
-                self._solver_input["b"] = cvxopt.matrix(-self.opt.b(self._p).toarray())
-
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem using CVXOPT.
-
-        @return The solution of the optimization problem.
-        """
-        self._solution = self._cvxopt.solvers.qp(**self._solver_input)
-        return self._solution["x"]
-
-    def stats(self):
-        """! Statistics relating to the previous call to solve.
-
-        @return Dictionary containing the statistics.
-        """
-        return self._solution
-
-    def did_solve(self):
-        """! Returns True when the problem was solved.
-
-        @return Boolean indicating if the solver converged.
-        """
-        return self._solution["status"] == "optimal"
-
-    def number_of_iterations(self):
-        """! Number of iterations it took the solver to converge.
-
-        @return Number of iterations.
-        """
-        return self._solution["iterations"]
-
-
-################################################################
-# Scipy Minimize solvers (https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize.html)
-
-
-class ScipyMinimizeSolver(Solver):
-    """Scipy solver (scipy.optimize.minimize) interface."""
-
-    ## Methods that require the Jacobian of the objective
-    methods_req_jac = {
-        "CG",
-        "BFGS",
-        "Newton-CG",
-        "L-BFGS-B",
-        "TNC",
-        "SLSQP",
-        "dogleg",
-        "trust-ncg",
-        "trust-krylov",
-        "trust-exact",
-        "trust-constr",
-    }
-
-    ## Methods that require the Hessian of the objective
-    methods_req_hess = {
-        "Newton-CG",
-        "dogleg",
-        "trust-ncg",
-        "trust-krylov",
-        "trust-exact",
-        "trust-constr",
-    }
-
-    ## Methods that handle constrained optimization problems.
-    methods_handle_constraints = {"COBYLA", "SLSQP", "trust-constr"}
-
-    def setup(
-        self,
-        method: str = "SLSQP",
-        tol: Union[None, float] = None,
-        options: Union[None, Dict] = None,
-    ):
-        """Setup the Scipy solver.
-
-        @param method Type of solver. Default is "SLSQP".
-        @param tol Tolerance for termination. When tol is specified, the selected minimization algorithm sets some relevant solver-specific tolerance(s) equal to tol. For detailed control, use solver-specific options.
-        @param options A dictionary of solver options.
-        @return The instance of the solve (i.e. self).
-        """
-
-        # Input check
-        if self.opt_type in CONSTRAINED_OPT and (
-            method not in ScipyMinimizeSolver.methods_handle_constraints
-        ):
-            raise TypeError(
-                f"optimization problem has constraints, the method '{method}' is not suitable"
-            )
-
-        # Setup class attributes
-
-        ## Container for the statistics.
-        self._stats = None
-
-        ## Method name.
-        self.method = method
-
-        # Setup minimize input parameters
-
-        ## Input to the minimize method
-        self.minimize_input = {
-            "fun": self.f,
-            "method": method,
-            "x0": self._x0.copy(),
-        }
-
-        if tol is not None:
-            self.minimize_input["tol"] = tol
-
-        if options is not None:
-            self.minimize_input["options"] = options
-
-        if method in ScipyMinimizeSolver.methods_req_jac:
-            self.minimize_input["jac"] = self.jac
-
-        if method in ScipyMinimizeSolver.methods_req_hess:
-            self.minimize_input["hess"] = self.hess
-
-        ## Constraints definition passed to the minimize method.
-        self._constraints = {}
-        if method in ScipyMinimizeSolver.methods_handle_constraints:
-            if method != "trust-constr":
-                if self.opt_type in CONSTRAINED_OPT:
-                    self._constraints["constr"] = {
-                        "type": "ineq",
-                        "fun": self.v,
-                        "jac": self.dv,
-                    }
-            else:
-                if self.opt.nk:
-                    self._constraints["k"] = LinearConstraint(
-                        A=csc_matrix(self.opt.M(self._p).toarray()),
-                        lb=-self.opt.c(self._p).toarray().flatten(),
-                        ub=self.opt.inf * np.ones(self.opt.nk),
-                    )
-
-                if self.opt.na:
-                    eq = -self.opt.b(self._p).toarray().flatten()
-                    self._constraints["a"] = LinearConstraint(
-                        A=csc_matrix(self.opt.A(self._p).toarray()),
-                        lb=eq,
-                        ub=eq,
-                    )
-
-                if self.opt.ng:
-                    self._constraints["g"] = NonlinearConstraint(
-                        fun=self.g,
-                        lb=np.zeros(self.opt.ng),
-                        ub=self.opt.inf * np.ones(self.opt.ng),
-                        jac=self.dg,
-                        hess=self.ddg,
-                    )
-
-                if self.opt.nh:
-                    self._constraints["h"] = NonlinearConstraint(
-                        fun=self.h,
-                        lb=np.zeros(self.opt.nh),
-                        ub=np.zeros(self.opt.nh),
-                        jac=self.dh,
-                        hess=self.ddh,
-                    )
-
-        return self
-
-    def f(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return float(self.opt.f(x, self._p).toarray().flatten()[0])
-
-    def jac(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.df(x, self._p).toarray().flatten()
-
-    def hess(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.ddf(x, self._p).toarray()
-
-    def v(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.v(x, self._p).toarray().flatten()
-
-    def dv(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.dv(x, self._p).toarray()
-
-    def g(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.g(x, self._p).toarray().flatten()
-
-    def dg(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.dg(x, self._p).toarray()
-
-    def ddg(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.ddg(x, self._p).toarray()
-
-    def h(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.h(x, self._p).toarray().flatten()
-
-    def dh(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.dh(x, self._p).toarray()
-
-    def ddh(self, x: cs.np.ndarray) -> cs.np.ndarray:
-        """! Internal method."""
-        return self.opt.ddh(x, self._p).toarray()
-
-    def reset_initial_seed(self, x0) -> None:
-        """! Reset initial seed for the optimization problem.
-
-        @param x0 The initial seed.
-        """
-        super().reset_initial_seed(x0)
-        self.minimize_input["x0"] = self._x0.copy()
-
-    def reset_parameters(self, p: Dict[str, ArrayType]):
-        """! Reset the parameters.
-
-        @param p The values for the parameters.
-        """
-        super().reset_parameters(p)
-        if self.method == "trust-constr":
-            if self.opt.nk:
-                self._constraints["k"].A = csc_matrix(self.opt.M(self._p).toarray())
-                self._constraints["k"].lb = -self.opt.c(self._p).toarray().flatten()
-            if self.opt.na:
-                eq = -self.opt.b(self._p).toarray().flatten()
-                self._constraints["a"].A = csc_matrix(self.opt.A(self._p).toarray())
-                self._constraints["a"].lb = eq
-                self._constraints["a"].ub = eq
-        if self._constraints:
-            self.minimize_input["constraints"] = list(self._constraints.values())
-
-    def _solve(self) -> CasADiArrayType:
-        """! Solve the optimization problem using Scipy.
-
-        @return The solution of the optimization problem.
-        """
-        self._solution = minimize(**self.minimize_input)
-        return self._solution.x
-
-    def stats(self):
-        """! Statistics relating to the previous call to solve.
-
-        @return Dictionary containing the statistics.
-        """
-        return self._solution
-
-    def did_solve(self):
-        """! Returns True when the problem was solved.
-
-        @return Boolean indicating if the solver converged.
-        """
-        return self._solution.success
-
-    def number_of_iterations(self):
-        """! Number of iterations it took the solver to converge.
-
-        @return Number of iterations.
-        """
-        return self._solution.nit

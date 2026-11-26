@@ -3,7 +3,7 @@
 import casadi as cs
 from .sx_container import SXContainer
 from .spatialmath import arrayify_args, ArrayType, CasADiArrayType
-from .optimization import *
+from .optimization import Optimization
 from .models import Model, TaskModel, RobotModel
 from typing import List, Union
 
@@ -556,92 +556,16 @@ class OptimizationBuilder:
     def build(self) -> Optimization:
         """! Build the optimization problem."""
 
-        # Setup optimization
-        nlin = (
-            self._lin_ineq_constraints.numel() + self._lin_eq_constraints.numel()
-        )  # total no. linear constraints
-        nnlin = (
-            self._ineq_constraints.numel() + self._eq_constraints.numel()
-        )  # total no. nonlinear constraints
-
-        if self.is_cost_quadratic():
-            # True -> use QP formulation
-
-            if self._decision_variables.has_discrete_variables():
-                opt = MixedIntegerNonlinearCostNonlinearConstrained(
-                    self._decision_variables,
-                    self._parameters,
-                    self._cost_terms,
-                    self._lin_eq_constraints,
-                    self._lin_ineq_constraints,
-                    self._eq_constraints,
-                    self._ineq_constraints,
-                )
-            else:
-                if nnlin > 0:
-                    opt = QuadraticCostNonlinearConstraints(
-                        self._decision_variables,
-                        self._parameters,
-                        self._cost_terms,
-                        self._lin_eq_constraints,
-                        self._lin_ineq_constraints,
-                        self._eq_constraints,
-                        self._ineq_constraints,
-                    )
-                elif nlin > 0:
-                    opt = QuadraticCostLinearConstraints(
-                        self._decision_variables,
-                        self._parameters,
-                        self._cost_terms,
-                        self._lin_eq_constraints,
-                        self._lin_ineq_constraints,
-                    )
-                else:
-                    opt = QuadraticCostUnconstrained(
-                        self._decision_variables,
-                        self._parameters,
-                        self._cost_terms,
-                    )
-        else:
-            # False -> use (nonlinear) Optimization formulation
-
-            if self._decision_variables.has_discrete_variables():
-                opt = MixedIntegerNonlinearCostNonlinearConstrained(
-                    self._decision_variables,
-                    self._parameters,
-                    self._cost_terms,
-                    self._lin_eq_constraints,
-                    self._lin_ineq_constraints,
-                    self._eq_constraints,
-                    self._ineq_constraints,
-                )
-            else:
-                if nnlin > 0:
-                    opt = NonlinearCostNonlinearConstraints(
-                        self._decision_variables,
-                        self._parameters,
-                        self._cost_terms,
-                        self._lin_eq_constraints,
-                        self._lin_ineq_constraints,
-                        self._eq_constraints,
-                        self._ineq_constraints,
-                    )
-                elif nlin > 0:
-                    opt = NonlinearCostLinearConstraints(
-                        self._decision_variables,
-                        self._parameters,
-                        self._cost_terms,
-                        self._lin_eq_constraints,
-                        self._lin_ineq_constraints,
-                    )
-                else:
-                    opt = NonlinearCostUnconstrained(
-                        self._decision_variables,
-                        self._parameters,
-                        self._cost_terms,
-                    )
-
+        opt = Optimization(
+            self._decision_variables,
+            self._parameters,
+            self._cost_terms,
+            self._lin_eq_constraints,
+            self._lin_ineq_constraints,
+            self._eq_constraints,
+            self._ineq_constraints,
+            self._constraint_rows,
+        )
         opt.set_models(self._models)
-        opt.specify_bounded_constraints(self._constraint_rows)
 
         return opt

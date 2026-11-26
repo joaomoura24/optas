@@ -45,8 +45,8 @@ class TOMPCCPlanner:
         T = 20  # number of step
         Lx = float(Lx)  # length of slider (box) in x-axis
         Ly = float(Ly)  # length of slider (box) in y-axis
-        phi_lo = math.atan2(Lx, Ly)  # lower limit for phi
-        phi_up = -phi_lo  # upper limit for phi
+        phi_up = math.atan2(Lx, Ly)  # upper limit for phi (contact stays on the side)
+        phi_lo = -phi_up  # lower limit for phi
         L = optas.diag([1, 1, 0.5])  # limit surface model
         SxC0 = 0.5 * Ly  # initial contact position in x-axis of slider
         SyC0 = 0.0  # initial contact position in y-axis of slider
@@ -132,7 +132,7 @@ class TOMPCCPlanner:
                 optas.horzcat(R @ L @ JC.T, o3, o3),
                 optas.horzcat(o2.T, 1, -1),
             )
-            f = K @ u
+            f = K @ optas.vertcat(-u[0], u[1:])  # normal force points into the slider
 
             # Add constraint
             builder.add_equality_constraint(f"dynamics_{k}", xn, x + dt * f)
@@ -176,8 +176,7 @@ class TOMPCCPlanner:
 
         # Setup solver
         opt = builder.build()
-        # self.solver = optas.CasADiSolver(opt).setup('ipopt')
-        self.solver = optas.ScipyMinimizeSolver(opt).setup("SLSQP")
+        self.solver = optas.CasADiSolver(opt).setup("ipopt")
 
         # For later
         self.Tmax = float(T - 1) * dt
@@ -195,7 +194,7 @@ class TOMPCCPlanner:
         self.solver.reset_initial_seed(
             {
                 "state/y/x": state_x_init,
-                "control/u": 0.01 * optas.DM.ones(4, self.T - 1),
+                "control/u/x": 0.01 * optas.DM.ones(4, self.T),
             }
         )
 
