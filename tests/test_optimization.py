@@ -60,6 +60,8 @@ def test_optimization():
     ]
 
     opt = optas.optimization.Optimization(dv, pr, ct)
+    assert opt.quadratic_cost is True
+    assert opt.ncon == 0
 
     opt.set_models(models)
     assert opt.models == models
@@ -96,7 +98,9 @@ def test_QuadraticCostUnconstrained():
     ct = SXContainer()
     ct["c"] = p * optas.sumsqr(x)
 
-    opt = optas.optimization.QuadraticCostUnconstrained(dv, pr, ct)
+    opt = optas.optimization.Optimization(dv, pr, ct)
+    assert opt.quadratic_cost is True
+    assert opt.ncon == 0
 
     def fun_known(x, p):
         return p * np.sum(x.flatten() ** 2)
@@ -144,7 +148,9 @@ def test_QuadraticCostLinearConstraints():
     lic["lic1"] = x[2] + 3.0 * x[4]
     lic["lic2"] = -2.0 * x[5] + x[2]
 
-    opt = optas.optimization.QuadraticCostLinearConstraints(dv, pr, ct, lec, lic)
+    opt = optas.optimization.Optimization(dv, pr, ct, lec, lic)
+    assert opt.quadratic_cost is True
+    assert opt.ncon == 3
 
     def fun_known(x, p):
         return p * np.sum(x.flatten() ** 2)
@@ -220,9 +226,9 @@ def test_QuadraticCostNonlinearConstraints():
     ic = SXContainer()
     ic["ic"] = x[1] + x[2] * x[0]
 
-    opt = optas.optimization.QuadraticCostNonlinearConstraints(
-        dv, pr, ct, lec, lic, ec, ic
-    )
+    opt = optas.optimization.Optimization(dv, pr, ct, lec, lic, ec, ic)
+    assert opt.quadratic_cost is True
+    assert opt.ncon == 6
 
     def fun_known(x, p):
         return p * np.sum(x.flatten() ** 2)
@@ -298,7 +304,10 @@ def test_NonlinearCostUnconstrained():
     ct = SXContainer()
     ct["c"] = p * optas.sumsqr(x) + x[0] * x[1] + 2.0 * (optas.cos(x[3]) - 1.0) ** 2
 
-    opt = optas.optimization.NonlinearCostUnconstrained(dv, pr, ct)
+    opt = optas.optimization.Optimization(dv, pr, ct)
+    assert opt.quadratic_cost is False
+    assert opt.P is None and opt.q is None
+    assert opt.ncon == 0
 
     def fun_known(x, p):
         return (
@@ -341,7 +350,10 @@ def test_NonlinearCostLinearConstraints():
     lic["lic1"] = x[2] + 3.0 * x[4]
     lic["lic2"] = -2.0 * x[5] + x[2]
 
-    opt = optas.optimization.NonlinearCostLinearConstraints(dv, pr, ct, lec, lic)
+    opt = optas.optimization.Optimization(dv, pr, ct, lec, lic)
+    assert opt.quadratic_cost is False
+    assert opt.P is None and opt.q is None
+    assert opt.ncon == 3
 
     def fun_known(x, p):
         return (
@@ -412,9 +424,10 @@ def test_NonlinearCostNonlinearConstraints():
     ic = SXContainer()
     ic["ic"] = x[1] + x[2] * x[0]
 
-    opt = optas.optimization.NonlinearCostNonlinearConstraints(
-        dv, pr, ct, lec, lic, ec, ic
-    )
+    opt = optas.optimization.Optimization(dv, pr, ct, lec, lic, ec, ic)
+    assert opt.quadratic_cost is False
+    assert opt.P is None and opt.q is None
+    assert opt.ncon == 6
 
     def fun_known(x, p):
         return (
@@ -501,9 +514,10 @@ def test_MixedIntegerNonlinearCostNonlinearConstrained():
     ic = SXContainer()
     ic["ic"] = x[1] + x[2] * x[0]
 
-    opt = optas.optimization.MixedIntegerNonlinearCostNonlinearConstrained(
-        dv, pr, ct, lec, lic, ec, ic
-    )
+    opt = optas.optimization.Optimization(dv, pr, ct, lec, lic, ec, ic)
+    assert opt.quadratic_cost is False
+    assert opt.P is None and opt.q is None
+    assert opt.ncon == 6
 
     def fun_known(x, p):
         return (
@@ -566,3 +580,36 @@ def test_MixedIntegerNonlinearCostNonlinearConstrained():
     }
     for attr, exp_value in attr_exp_value_map.items():
         assert getattr(opt, attr) == exp_value
+
+
+def test_default_constraint_rows():
+    dv = SXContainer()
+    dv["x"] = optas.SX.sym("x", 3)
+    x = dv.vec()
+
+    ct = SXContainer()
+    ct["c"] = optas.sumsqr(x)
+
+    lec, lic, ec, ic = SXContainer(), SXContainer(), SXContainer(), SXContainer()
+    lec["lec"] = x[0] - 1.0
+    lic["lic"] = x[1]
+    ec["ec"] = x[0] * x[2]
+    ic["ic"] = x[1:] ** 2
+
+    opt = optas.optimization.Optimization(dv, SXContainer(), ct, lec, lic, ec, ic)
+
+    # one row per constraint: inequalities in [0, inf], equalities in [0, 0]
+    assert list(opt.constraint_rows) == ["lic", "ic", "lec", "ec"]
+    assert opt.ncon == 5
+    x0 = [2.0, 3.0, 4.0]
+    p0 = optas.DM.zeros(0)
+    assert isclose(opt.con(x0, p0).toarray().flatten(), [3.0, 9.0, 16.0, 1.0, 8.0])
+    assert isclose(opt.lbcon(p0).toarray().flatten(), [0.0] * 5)
+    assert isclose(opt.ubcon(p0).toarray().flatten(), [np.inf] * 3 + [0.0] * 2)
+
+    # rows given explicitly (as the builder does) replace the default ones
+    rows = {"box": (-1.0, x, 1.0)}
+    opt = optas.optimization.Optimization(dv, SXContainer(), ct, constraint_rows=rows)
+    assert opt.ncon == 3
+    assert isclose(opt.lbcon(p0).toarray().flatten(), [-1.0] * 3)
+    assert isclose(opt.ubcon(p0).toarray().flatten(), [1.0] * 3)

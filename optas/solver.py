@@ -4,26 +4,10 @@ import numpy as np
 import casadi as cs
 from dataclasses import dataclass
 from scipy.interpolate import interp1d
-from .optimization import (
-    Optimization,
-    QuadraticCostLinearConstraints,
-    QuadraticCostNonlinearConstraints,
-    NonlinearCostLinearConstraints,
-    NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-)
+from .optimization import Optimization
 from .models import RobotModel
 from .spatialmath import ArrayType, CasADiArrayType
 from typing import Dict, Tuple, List, Optional
-
-## Optimization problem types that are constrained.
-CONSTRAINED_OPT = {
-    QuadraticCostLinearConstraints,
-    QuadraticCostNonlinearConstraints,
-    NonlinearCostLinearConstraints,
-    NonlinearCostNonlinearConstraints,
-    MixedIntegerNonlinearCostNonlinearConstrained,
-}
 
 ################################################################
 # Helpers
@@ -115,7 +99,7 @@ class CasADiSolver:
         # Setup constraints
 
         # Constraints lbg(p) <= g(x, p) <= ubg(p): one row per equality or bound
-        if self.opt_type in CONSTRAINED_OPT:
+        if self.opt.ncon > 0:
             problem["g"] = cs.cse(self.opt.con(x, p))
             lbg, ubg = self.opt.lbcon(p), self.opt.ubcon(p)
             self._bounds = cs.Function("bounds", [p], [lbg, ubg])
@@ -154,14 +138,6 @@ class CasADiSolver:
         return self
 
     @property
-    def opt_type(self) -> type:
-        """! Optimization type.
-
-        @return The type of the optimization problem.
-        """
-        return type(self.opt)
-
-    @property
     def x0(self) -> cs.DM:
         """! Initial guess for the optimization problem (set using reset_initial_seed)."""
         return cs.DM(self._x0)
@@ -196,7 +172,7 @@ class CasADiSolver:
         @return Solution to the problem.
         """
         solver_input = {"x0": self._x0, "p": self._p}
-        if self.opt_type in CONSTRAINED_OPT:
+        if self.opt.ncon > 0:
             solver_input["lbg"] = self._lbg
             solver_input["ubg"] = self._ubg
         self._solution = self._solver(**solver_input)
@@ -421,7 +397,7 @@ class CasADiSolver:
             ]
         )
         solver_input = {"x0": self._x0, "p": p}
-        if self.opt_type in CONSTRAINED_OPT:
+        if self.opt.ncon > 0:
             solver_input["lbg"], solver_input["ubg"] = self._bounds(p)
         x = self._solver(**solver_input)["x"]
         res = [

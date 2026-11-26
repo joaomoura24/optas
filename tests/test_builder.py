@@ -362,7 +362,9 @@ class Test_OptimizationBuilder:
         X = builder.get_model_states("test")
         builder.add_cost_term("test_term", optas.sumsqr(X))
         opt = builder.build()
-        assert isinstance(opt, optas.optimization.QuadraticCostUnconstrained)
+        assert opt.quadratic_cost == True
+        assert opt.ncon == 0
+        assert opt.ng + opt.nh == 0
 
     def test_build_QuadraticCostLinearConstraints(self):
         T = 10
@@ -372,7 +374,9 @@ class Test_OptimizationBuilder:
         builder.add_cost_term("test_term", optas.sumsqr(X))
         builder.add_bound_inequality_constraint("test_limits", -100, X, 100)
         opt = builder.build()
-        assert isinstance(opt, optas.optimization.QuadraticCostLinearConstraints)
+        assert opt.quadratic_cost == True
+        assert opt.ncon == 20  # one row per bounded element
+        assert opt.ng + opt.nh == 0
 
     def test_build_QuadraticCostNonlinearConstraints(self):
         T = 10
@@ -383,7 +387,9 @@ class Test_OptimizationBuilder:
         builder.add_bound_inequality_constraint("test_limits", -100, X, 100)
         builder.add_equality_constraint("test_eq_constraints", X[0] * X[1])
         opt = builder.build()
-        assert isinstance(opt, optas.optimization.QuadraticCostNonlinearConstraints)
+        assert opt.quadratic_cost == True
+        assert opt.ncon == 21
+        assert opt.ng + opt.nh == 1
 
     def test_build_NonlinearCostUnconstrained(self):
         T = 10
@@ -393,7 +399,9 @@ class Test_OptimizationBuilder:
         builder.add_cost_term("test_term1", optas.sumsqr(X))
         builder.add_cost_term("test_term2", optas.cos(X[0] * X[1]))
         opt = builder.build()
-        assert isinstance(opt, optas.optimization.NonlinearCostUnconstrained)
+        assert opt.quadratic_cost == False
+        assert opt.ncon == 0
+        assert opt.ng + opt.nh == 0
 
     def test_build_NonlinearCostLinearConstraints(self):
         T = 10
@@ -404,7 +412,9 @@ class Test_OptimizationBuilder:
         builder.add_cost_term("test_term2", optas.cos(X[0] * X[1]))
         builder.add_bound_inequality_constraint("test_limits", -100, X, 100)
         opt = builder.build()
-        assert isinstance(opt, optas.optimization.NonlinearCostLinearConstraints)
+        assert opt.quadratic_cost == False
+        assert opt.ncon == 20  # one row per bounded element
+        assert opt.ng + opt.nh == 0
 
     def test_build_NonlinearCostNonlinearConstraints(self):
         T = 10
@@ -416,4 +426,6 @@ class Test_OptimizationBuilder:
         builder.add_bound_inequality_constraint("test_limits", -100, X, 100)
         builder.add_equality_constraint("test_eq_constraints", X[0] * X[1])
         opt = builder.build()
-        assert isinstance(opt, optas.optimization.NonlinearCostNonlinearConstraints)
+        assert opt.quadratic_cost == False
+        assert opt.ncon == 21
+        assert opt.ng + opt.nh == 1
