@@ -11,7 +11,7 @@
 [![Docs](https://github.com/joaomoura24/optas/actions/workflows/documentation.yaml/badge.svg)](https://github.com/joaomoura24/optas/actions/workflows/documentation.yaml)
 
 
-OpTaS is an OPtimization-based TAsk Specification library for trajectory optimization and model predictive control.
+OpTaS (OPtimization-based TAsk Specification) is a light layer over [CasADi](https://web.casadi.org/) for robot optimization: it loads robots from URDF, gives their kinematics as CasADi expressions, and turns costs and constraints on them into CasADi problems for inverse kinematics, trajectory optimization and model predictive control.
 
 - Code: [https://github.com/joaomoura24/optas](https://github.com/joaomoura24/optas)
 - Documentation: [https://joaomoura24.github.io/optas/](https://joaomoura24.github.io/optas/)
