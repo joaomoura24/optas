@@ -188,3 +188,47 @@ class TestBoundedConstraints:
         # and as inputs of to_function
         F = solver.to_function("F", inputs=["hi"])
         assert isclose(F([0.2, 1.0]), [0.2, 0.8])
+
+
+class TestEvaluate:
+    @staticmethod
+    def solver():
+        builder, x = TestBoundedConstraints.build()
+        builder.add_cost_term("g", 2.0 * x[0])
+        solver = optas.CasADiSolver(builder.build()).setup("qpoases")
+        solver.reset_parameters({"lo": [-1.0, -1.0], "hi": [1.0, 1.0], "t": 1.0})
+        return solver
+
+    def test_violated_constraints(self):
+        solver = self.solver()
+        assert solver.violated_constraints({"x": [0.5, 0.5]}) == []
+
+        # x0 above its upper bound; the sum is still 1, so only the box is violated
+        (vc,) = solver.violated_constraints({"x": [1.5, -0.5]})
+        assert vc.label == "box"
+        assert isclose(vc.lower, [-1.0, -1.0])
+        assert isclose(vc.value, [1.5, -0.5])
+        assert isclose(vc.upper, [1.0, 1.0])
+        assert isclose(vc.violation, [0.5, 0.0])
+        assert "box" in str(vc)
+
+        # an equality is violated on either side, within tol it is not
+        for value in ([0.2, 0.2], [0.9, 0.9]):
+            assert [v.label for v in solver.violated_constraints({"x": value})] == [
+                "sum"
+            ]
+        assert solver.violated_constraints({"x": [0.5, 0.5 + 1e-8]}) == []
+
+        # parameters given explicitly instead of the ones set by reset_parameters
+        p = {"lo": [-1.0, -1.0], "hi": [2.0, 1.0], "t": 1.0}
+        assert solver.violated_constraints({"x": [1.5, -0.5]}, p) == []
+
+    def test_evaluate_cost(self):
+        solver = self.solver()
+        x = {"x": [2.0, 3.0]}
+        terms = solver.evaluate_cost_terms(x)
+        assert list(terms) == ["f", "g"]
+        assert isclose(terms["f"], 1.0 + 4.0)
+        assert isclose(terms["g"], 4.0)
+        assert isclose(solver.evaluate_cost(x), 9.0)
+        assert isclose(solver.evaluate_cost(x, {"t": 0.0}), 4.0 + 9.0 + 4.0)

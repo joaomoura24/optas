@@ -160,11 +160,8 @@ class Controller:
         self.solver.reset_parameters(params)
         self.solution = self.solver.solve()
         if not self.solver.did_solve():
-            for vc_collection in self.solver.violated_constraints(
-                self.solution, params
-            ):
-                for vc in vc_collection:
-                    print(vc)
+            for vc in self.solver.violated_constraints(self.solution):
+                print(vc)
             raise RuntimeError("solver failed")
         plan_y = self.solver.interpolate(
             self.solution[f"{self.pm_name}/y"], self.duration

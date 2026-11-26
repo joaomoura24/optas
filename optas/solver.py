@@ -41,6 +41,32 @@ def _unpack(vec: ArrayType, layout: Dict) -> Dict[str, cs.DM]:
     return out
 
 
+@dataclass
+class ViolatedConstraint:
+    """! A constraint lower <= value <= upper that is violated (see CasADiSolver.violated_constraints).
+
+    The arrays have one element per constraint element (column-major for matrices).
+    """
+
+    label: str
+    lower: np.ndarray
+    value: np.ndarray
+    upper: np.ndarray
+
+    @property
+    def violation(self) -> np.ndarray:
+        """! How far each element is outside its bounds (zero when inside)."""
+        return np.maximum(
+            np.maximum(self.lower - self.value, self.value - self.upper), 0
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"{self.label}: max violation {self.violation.max():.3g}\n"
+            f"  lower {self.lower}\n  value {self.value}\n  upper {self.upper}"
+        )
+
+
 class CasADiSolver:
     """! Solves an optimization problem with a CasADi QP (conic) or NLP solver plugin."""
 
@@ -75,6 +101,8 @@ class CasADiSolver:
         # Bounds of the constraint rows, set in setup
         self._bounds = None
         self._bounds_p_index = np.zeros(0, dtype=int)
+        self._rows = None  # functions built on first use of violated_constraints
+        self._cost_terms = None  # and evaluate_cost_terms
 
     def setup(self, solver_name: str, solver_options: Optional[Dict] = None):
         """! Setup the optimization solver.
@@ -237,124 +265,84 @@ class CasADiSolver:
         """
         return self.stats()["iter_count"]
 
+    def _vectors(
+        self, x: Dict[str, ArrayType], p: Optional[Dict[str, ArrayType]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """! Vectorize x and p (when p is None, the parameters set by reset_parameters)."""
+        xv = np.zeros(self.opt.nx)
+        _pack(xv, self._x_layout, x)
+        if p is None:
+            return xv, self._p
+        pv = np.zeros(self.opt.np)
+        _pack(pv, self._p_layout, p)
+        return xv, pv
+
     def violated_constraints(
-        self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
-    ) -> Tuple:
-        """! Indicate the violated constraints.
+        self,
+        x: Dict[str, ArrayType],
+        p: Optional[Dict[str, ArrayType]] = None,
+        tol: float = 1e-6,
+    ) -> List["ViolatedConstraint"]:
+        """! Return the constraints that x violates, e.g. to see why a solve failed.
 
-        @param x The values for the decision variables.
-        @param p The values for the parameters.
-        @return Several lists that contain information regarding which constraints are violated.
+        A constraint is violated when any of its elements is outside
+        [lower - tol, upper + tol].
+
+        @param x The values for the decision variables, e.g. the dictionary returned by solve.
+        @param p The values for the parameters. Default: the parameters set by reset_parameters.
+        @param tol Tolerance on the bounds.
+        @return List of ViolatedConstraint, in the order the constraints were added.
         """
-        x = self.opt.decision_variables.dict2vec(x)
-        p = self.opt.parameters.dict2vec(p)
+        if self._rows is None:
+            outputs = []
+            for lower, expression, upper in self.opt.constraint_rows.values():
+                ones = cs.DM.ones(*expression.shape)
+                outputs += [
+                    cs.vec(lower * ones),
+                    cs.vec(expression),
+                    cs.vec(upper * ones),
+                ]
+            self._rows = cs.Function("rows", [self.opt.x, self.opt.p], outputs)
 
-        @dataclass
-        class ViolatedConstraint:
-            label: str
-            ctype: str
-            diff: cs.DM
-            pattern: cs.DM
-
-            def __str__(self):
-                return f"\n{self.label} [{self.ctype}]:\n{self.pattern}\n"
-
-            def __repr__(self):
-                info = str(self)
-                max_width = max(len(line) for line in info.split("\n"))
-                return "=" * max_width + info + "-" * max_width + "\n"
-
-            @property
-            def verbose_info(self):
-                info = str(self)
-                info += f"{self.diff}\n"
-                return info
-
-        lin_eq_violated_constraints = []
-        for label, sx_var in self.opt.lin_eq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            lin_eq_violated_constraints.append(
-                ViolatedConstraint(label, "lin_eq", diff, diff >= 0.0)
-            )
-
-        eq_violated_constraints = []
-        for label, sx_var in self.opt.eq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            eq_violated_constraints.append(
-                ViolatedConstraint(label, "eq", diff, diff >= 0.0)
-            )
-
-        lin_ineq_violated_constraints = []
-        for label, sx_var in self.opt.lin_ineq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            lin_ineq_violated_constraints.append(
-                ViolatedConstraint(label, "lin_ineq", diff, diff >= 0.0)
-            )
-
-        ineq_violated_constraints = []
-        for label, sx_var in self.opt.ineq_constraints.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            diff = fun(x, p)
-            ineq_violated_constraints.append(
-                ViolatedConstraint(label, "ineq", diff, diff >= 0.0)
-            )
-
-        return (
-            lin_eq_violated_constraints,
-            eq_violated_constraints,
-            lin_ineq_violated_constraints,
-            ineq_violated_constraints,
-        )
+        values = self._rows(*self._vectors(x, p))
+        violated = []
+        for i, label in enumerate(self.opt.constraint_rows):
+            lower, value, upper = [
+                np.asarray(v).flatten() for v in values[3 * i : 3 * i + 3]
+            ]
+            if np.any(value < lower - tol) or np.any(value > upper + tol):
+                violated.append(ViolatedConstraint(label, lower, value, upper))
+        return violated
 
     def evaluate_cost(
-        self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
-    ) -> CasADiArrayType:
-        """! Evaluates the cost function for given decision variables x and parameters p.
+        self, x: Dict[str, ArrayType], p: Optional[Dict[str, ArrayType]] = None
+    ) -> float:
+        """! Evaluate the cost function.
 
         @param x The values for the decision variables.
-        @param p The values for the parameters.
-        @return The cost that results from x and p.
+        @param p The values for the parameters. Default: the parameters set by reset_parameters.
+        @return The cost at x and p.
         """
-        x = self.opt.decision_variables.dict2vec(x)
-        p = self.opt.parameters.dict2vec(p)
-        return self.opt.f(x, p)
+        return float(self.opt.f(*self._vectors(x, p)))
 
     def evaluate_cost_terms(
-        self, x: Dict[str, ArrayType], p: Dict[str, ArrayType]
-    ) -> List:
-        """! Evaluates each cost term for given decision variables and parameters.
+        self, x: Dict[str, ArrayType], p: Optional[Dict[str, ArrayType]] = None
+    ) -> Dict[str, float]:
+        """! Evaluate each cost term.
 
         @param x The values for the decision variables.
-        @param p The values for the parameters.
-        @return List corresponding to each cost term evalauted at x, p.
+        @param p The values for the parameters. Default: the parameters set by reset_parameters.
+        @return Dictionary of the value of each cost term, by label.
         """
-
-        x = self.opt.decision_variables.dict2vec(x)
-        p = self.opt.parameters.dict2vec(p)
-
-        @dataclass
-        class CostTerm:
-            label: str
-            cost: float
-
-            def __str__(self):
-                return f"\n{self.label}: {self.cost}"
-
-            def __repr__(self):
-                info = str(self)
-                max_width = max(len(line) for line in info.split("\n"))
-                return "=" * max_width + info + "-" * max_width + "\n"
-
-        cost_terms = []
-        for label, sx_var in self.opt.cost_terms.items():
-            fun = cs.Function("fun", [self.opt.x, self.opt.p], [sx_var])
-            c = fun(x, p)
-            cost_terms.append(c)
-
-        return cost_terms
+        if self._cost_terms is None:
+            terms = self.opt.cost_terms
+            self._cost_terms = cs.Function(
+                "cost_terms", [self.opt.x, self.opt.p], list(terms.values())
+            )
+        values = self._cost_terms(*self._vectors(x, p))
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        return {label: float(v) for label, v in zip(self.opt.cost_terms, values)}
 
     @staticmethod
     def interpolate(traj: cs.DM, T: float, **interp_args) -> interp1d:
