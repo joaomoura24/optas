@@ -7,7 +7,7 @@ from .solver import CasADiSolver
 
 
 def __getattr__(name):
-    # Import the visualizer (and vtk) only when it is first used
+    # Import the visualizer (and viser) only when it is first used
     if name == "Visualizer":
         from .visualize import Visualizer
 

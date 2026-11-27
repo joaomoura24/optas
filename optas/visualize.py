@@ -1,1198 +1,653 @@
-"""! @brief Visualizer class implementation."""
+"""! @brief Visualizer: draws robots, trajectories and shapes in the browser with viser."""
 
 import os
-
-try:
-    import vtk
-except ImportError as e:
-    raise ImportError("Visualizer requires vtk: pip install 'pyoptas[vis]'") from e
-from vtkmodules.vtkFiltersSources import (
-    vtkCylinderSource,
-    vtkSphereSource,
-    vtkCubeSource,
-)
+import time
+import warnings
+from typing import Callable, Dict, List, Optional, Tuple
 
 import casadi as cs
-from casadi import DM
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
+from urdf_parser_py.urdf import Box, Cylinder, Mesh, Sphere
 
-from urdf_parser_py.urdf import Mesh, Cylinder, Sphere
+try:
+    import trimesh
+    import viser
+except ImportError as e:
+    raise ImportError("Visualizer requires viser: pip install 'pyoptas[vis]'") from e
 
 from .models import RobotModel
+from .spatialmath import ArrayType
 
-from .spatialmath import *
-
-from typing import List, Union, Dict
-
-
-class ActorList:
-    def __init__(self):
-        self.add_actors = True
-        self.actors = []
-
-    def start_adding_actors(self):
-        self.add_actors = True
-
-    def stop_adding_actors(self):
-        self.add_actors = False
-
-    def append(self, actor):
-        if self.add_actors:
-            self.actors.append(actor)
+## Color of robot links whose URDF gives none.
+DEFAULT_ROBOT_RGB = (0.7, 0.7, 0.7)
 
 
-class AnimationCallback:
-    def __init__(self, traj, duration, iren, ren):
-        # Setup class attributes
-        self.nsteps = len(traj)
-        self.dt = duration / float(self.nsteps - 1)
-        self.dt_ms = int(round(self.dt * 1e3))
-        self.step = 0
-        self.iren = iren
-        self.traj = traj
-        self.prev = None
-        self.ren = ren
+def _vec(value: ArrayType) -> np.ndarray:
+    """! Flatten a list, numpy array or CasADi DM into a float numpy vector."""
+    return np.asarray(value, dtype=float).flatten()
 
-    def start(self):
-        self.iren.AddObserver("TimerEvent", self.callback)
-        self.timer_id = self.iren.CreateRepeatingTimer(self.dt_ms)
 
-    def callback(self, *args):
-        # Remove previous actors
-        if self.prev is not None:
-            for actor in self.prev:
-                self.ren.RemoveActor(actor)
+def _color(rgb: Optional[ArrayType], default=(1.0, 1.0, 1.0)) -> Tuple[int, int, int]:
+    """! RGB in [0, 1] (default when None) as the uint8 tuple viser takes."""
+    rgb = default if rgb is None else _vec(rgb)[:3]
+    return tuple(int(round(255 * float(c))) for c in rgb)
 
-        # Create new robot actors
-        current = self.traj[self.step]
-        for actor in current:
-            self.ren.AddActor(actor)
 
-        # Render to window
-        self.iren.GetRenderWindow().Render()
+def _opacity(alpha: float) -> Optional[float]:
+    """! viser opacity: None when opaque (cheaper to render)."""
+    alpha = float(alpha)
+    return None if alpha >= 1.0 else alpha
 
-        # Reset
-        self.step = (self.step + 1) % self.nsteps
-        self.prev = current
+
+def _wxyz_from_matrix(R: np.ndarray) -> np.ndarray:
+    """! Quaternion (w, x, y, z), the order viser takes, of a rotation matrix."""
+    x, y, z, w = Rot.from_matrix(R).as_quat()
+    return np.array([w, x, y, z])
+
+
+def _wxyz(
+    orientation: ArrayType, euler_seq: str = "xyz", euler_degrees: bool = False
+) -> np.ndarray:
+    """! Quaternion (w, x, y, z) of a quaternion (x, y, z, w) or Euler angles."""
+    orientation = _vec(orientation)
+    if orientation.size == 4:
+        R = Rot.from_quat(orientation)
+    elif orientation.size == 3:
+        R = Rot.from_euler(euler_seq, orientation, degrees=euler_degrees)
+    else:
+        raise ValueError(
+            f"orientation must be a quaternion (x, y, z, w) or Euler angles, got {orientation.size} values"
+        )
+    x, y, z, w = R.as_quat()
+    return np.array([w, x, y, z])
+
+
+def _alphas(alpha_spec: Optional[Dict], n: int) -> List[float]:
+    """! Transparency of each of the n elements of a trajectory.
+
+    Styles: "none" (all 1), "const" (all alpha), "A" (from alpha_min to alpha_max),
+    "B" (alpha_min, last alpha_max), "C" (alpha_start, alpha_mid..., alpha_end).
+    """
+    spec = {"style": "none"} if alpha_spec is None else alpha_spec
+    style = spec["style"]
+    lo, hi = spec.get("alpha_min", 0.1), spec.get("alpha_max", 1.0)
+    if style == "none":
+        return [1.0] * n
+    if style == "const":
+        return [spec.get("alpha", 1.0)] * n
+    if style == "A":
+        return np.linspace(lo, hi, n).tolist()
+    if style == "B":
+        return [lo] * (n - 1) + [hi]
+    if style == "C":
+        mid = [spec.get("alpha_mid", 0.1)] * (n - 2)
+        return [spec.get("alpha_start", 1.0)] + mid + [spec.get("alpha_end", 1.0)]
+    raise ValueError(f"unknown alpha_spec style '{style}'")
+
+
+class _RobotVisuals:
+    """! The visual elements of a robot and a CasADi function of their poses."""
+
+    def __init__(self, robot_model: RobotModel):
+        urdf = robot_model.get_urdf()
+        materials = {
+            m.name: m.color.rgba[:3] for m in urdf.materials if m.color is not None
+        }
+
+        q = cs.SX.sym("q", robot_model.ndof)
+        ## Names of the links, in the order of the outputs of link_poses.
+        self.link_names = [link.name for link in urdf.links]
+        link_tfs = [
+            robot_model.get_global_link_transform(name, q) for name in self.link_names
+        ]
+        ## Transforms of every link in the global frame, stacked as a 4 x 4n matrix.
+        self.link_poses = cs.Function("link_poses", [q], [cs.horzcat(*link_tfs)])
+
+        ## Visual elements: (link index, transform in the link frame, geometry, rgb).
+        self.visuals = []
+        for i, link in enumerate(urdf.links):
+            for visual in link.visuals:
+                if visual is None or visual.geometry is None:
+                    continue
+                T = np.eye(4)
+                if visual.origin is not None:
+                    T[:3, :3] = Rot.from_euler("xyz", visual.origin.rpy).as_matrix()
+                    T[:3, 3] = visual.origin.xyz
+                rgb = DEFAULT_ROBOT_RGB
+                material = visual.material
+                if material is not None:
+                    if material.color is not None:
+                        rgb = material.color.rgba[:3]
+                    elif material.name in materials:
+                        rgb = materials[material.name]
+                self.visuals.append((i, T, visual.geometry, rgb))
+
+        ## Directory that relative mesh filenames are resolved against.
+        self.dirname = str(robot_model.get_urdf_dirname())
+
+    def poses(self, q: ArrayType) -> List[np.ndarray]:
+        """! Transforms (4 x 4) of the links in the global frame at configuration q."""
+        tfs = np.asarray(self.link_poses(cs.vec(cs.DM(q))))
+        return [tfs[:, 4 * i : 4 * i + 4] for i in range(len(self.link_names))]
 
 
 class Visualizer:
-    """! This class defines the Visualizer for simple visualization."""
+    """! Visualizer that draws robots, trajectories and shapes in the browser (viser).
+
+    Create it, add elements, then call start(), which prints the address to open
+    (http://localhost:8080 by default) and keeps the server running. Elements are
+    added as viser scene nodes; every drawing method returns the viser handles, so
+    they can be moved or removed later (e.g. handle.position = ..., handle.remove()).
+    """
 
     def __init__(
         self,
-        window_size: List[int] = [1440, 810],
-        background_color: ArrayType = [0.0, 0.0, 0.0],
         camera_position: ArrayType = [2, 2, 2],
         camera_focal_point: ArrayType = [0, 0, 0],
         camera_view_up: ArrayType = [0, 0, 1],
-        quit_after_delay: Union[None, float] = None,
+        quit_after_delay: Optional[float] = None,
+        host: str = "0.0.0.0",
+        port: int = 8080,
     ):
-        """! Initializer for the Visualizer class.
+        """! Initializer for the Visualizer class (starts the viser server).
 
-        @param window_size The window size [W, H] for the visualizer.
-        @param background_color The color of the background (RGB), default is black.
         @param camera_position The position of the camera in the global frame.
-        @param camera_focal_point The focus point of the camera.
-        @param camera_view_up Direction of the up direction for the camera.
-        @param quit_after_delay Number of seconds to keep visualizer running, if None then the visualizer is run indefinitely until the user quits the window.
+        @param camera_focal_point The point the camera looks at.
+        @param camera_view_up The up direction of the camera.
+        @param quit_after_delay Number of seconds start() runs for; when None, it runs until Ctrl+C.
+        @param host Host the server listens on.
+        @param port Port the server listens on (viser takes the next free one when it is in use).
         @return An instance of the Visualizer class.
         """
+        ## The viser server, for anything this class does not wrap.
+        self.server = viser.ViserServer(host=host, port=port, verbose=False)
+        camera = self.server.initial_camera
+        camera.position = _vec(camera_position)
+        camera.look_at = _vec(camera_focal_point)
+        camera.up = _vec(camera_view_up)
 
-        self.ren = vtk.vtkRenderer()
-        self.ren.SetBackground(*background_color)
-        self.renWin = vtk.vtkRenderWindow()
-        self.renWin.AddRenderer(self.ren)
-        self.renWin.SetSize(int(window_size[0]), int(window_size[1]))
+        self._quit_after_delay = quit_after_delay
+        self._count = 0
+        self._robot_visuals = {}
+        self._meshes = {}
+        ## Animations as (duration, update(t)) where t is the time in seconds.
+        self._animations: List[Tuple[float, Callable[[float], None]]] = []
 
-        self.camera = self.ren.GetActiveCamera()
-        self.camera.SetPosition(*camera_position)
-        self.camera.SetFocalPoint(*camera_focal_point)
-        self.camera.SetViewUp(*camera_view_up)
+    def _name(self, kind: str) -> str:
+        """! Unique scene node name."""
+        self._count += 1
+        return f"/optas/{kind}_{self._count}"
 
-        self.iren = vtk.vtkRenderWindowInteractor()
-        self.iren.SetRenderWindow(self.renWin)
+    def _visuals(self, robot_model: RobotModel) -> _RobotVisuals:
+        """! Visual elements of a robot, built once per robot model."""
+        key = id(robot_model)
+        if key not in self._robot_visuals:
+            self._robot_visuals[key] = _RobotVisuals(robot_model)
+        return self._robot_visuals[key]
 
-        style = vtk.vtkInteractorStyleTrackballCamera()
-        self.iren.SetInteractorStyle(style)
-
-        self.actors = ActorList()
-
-        self.animate_callbacks = []
-
-        if isinstance(quit_after_delay, float):
-            assert quit_after_delay > 0.0, "the delay must be positive"
-            quit_after_delay_ms = int(quit_after_delay * 1000.0)
-            timer_id = self.iren.CreateOneShotTimer(quit_after_delay_ms)
-            self.iren.AddObserver("TimerEvent", self.close, timer_id)
-
-    # def append_actors(self, *actors):
-    #     for actor in actors:
-    #         if isinstance(actor, list):
-    #             self.actors += actor  # assume actor is a list of actors
-    #         else:
-    #             self.actors.append(actor)  # assume actor is a single actor
-
-    def reset_camera(self, position, view_dir, view_up):
-        """! Reset the camera pose.
-
-        @param position The position of the camera.
-        @param view_dir The direction that the camera should view.
-        @param view_up The up direction for the image.
-        """
-        focal_point = (np.asarray(position) + np.asarray(view_dir)).tolist()
-        self.camera.SetPosition(*position)
-        self.camera.SetFocalPoint(*focal_point)
-        self.camera.SetViewUp(*view_up)
+    def _load_mesh(self, filename: str, scale: Optional[ArrayType] = None):
+        """! Load a mesh file once (any format trimesh reads), None when it cannot be read."""
+        key = (filename, None if scale is None else tuple(_vec(scale)))
+        if key not in self._meshes:
+            try:
+                mesh = trimesh.load(filename, force="mesh")
+                if scale is not None:
+                    mesh.apply_scale(_vec(scale))
+            except Exception as e:  # e.g. a format that needs an extra package
+                warnings.warn(f"skipping mesh {filename}: {e}")
+                mesh = None
+            self._meshes[key] = mesh
+        return self._meshes[key]
 
     #
-    # Set/convert helper methods
+    # Shapes
     #
 
-    @staticmethod
-    @arrayify_args
-    def cvt_orientation_to_rotation_matrix(
-        orientation: ArrayType, euler_seq: str, euler_degrees: bool
-    ) -> DM:
-        """! Convert an orientation input to a rotation matrix.
-
-        @param orientation Either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return Rotation matrix.
-        """
-        orientation = orientation.toarray().flatten().tolist()
-        if len(orientation) == 4:
-            R = Rot.from_quat(orientation)
-        elif len(orientation) == 3:
-            R = Rot.from_euler(euler_seq, orientation, degrees=euler_degrees)
-        else:
-            raise ValueError(
-                f"length for orientation is incorrect, expected 3 or 4, got {len(orientation)}"
-            )
-        return cs.DM(R.as_matrix())
-
-    @staticmethod
-    @arrayify_args
-    def set_tf(
-        actor: vtk.vtkActor,
-        position: ArrayType,
-        orientation: ArrayType,
-        euler_seq: str,
-        euler_degrees: bool,
-    ) -> None:
-        """! Sets a transform to a vtk Actor.
-
-        @param actor A vtk actor object.
-        @param position The position of the transformation.
-        @param orientation Orientation of the transformation, either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        """
-        R = Visualizer.cvt_orientation_to_rotation_matrix(
-            orientation, euler_seq, euler_degrees
-        )
-        tf = rt2tr(R, position)
-        Visualizer.set_transformation(actor, tf)
-
-    @staticmethod
-    @arrayify_args
-    def set_transformation(actor: vtk.vtkActor, tf: ArrayType) -> None:
-        """! Sets a transformation to a vtk Actor.
-
-        @param actor A vtk actor object.
-        @param tf A homogenous transformation matrix.
-        """
-        tf = tf.toarray().flatten().tolist()
-        transform = vtk.vtkTransform()
-        transform.SetMatrix(tf)
-        actor.SetUserTransform(transform)
-
-    @staticmethod
-    @arrayify_args
-    def set_rgba(actor: vtk.vtkActor, rgb: ArrayType, alpha: float) -> None:
-        """! Set the RGB and alpha channels for an actor.
-
-        @param actor A vtk actor object.
-        @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        """
-        if rgb is not None:
-            rgb = rgb.toarray().flatten().tolist()
-            assert len(rgb) == 3, f"rgb is incorrect length, got {len(rgb)} expected 3"
-            actor.GetProperty().SetColor(*rgb)
-
-        alpha = alpha.toarray().flatten()[0]
-        assert (
-            0.0 <= alpha <= 1.0
-        ), f"the scalar alpha must be in the range [0, 1], got {alpha}"
-        actor.GetProperty().SetOpacity(alpha)
-
-    @staticmethod
-    @arrayify_args
-    def set_translation(actor: vtk.vtkActor, translation: ArrayType) -> None:
-        """! Set translation for an actor.
-
-        @param actor A vtk actor object.
-        @param translation The translation in the global frame.
-        """
-        translation = translation.toarray().flatten().tolist()
-        transform = vtk.vtkTransform()
-        transform.Translate(translation)
-        actor.SetUserTransform(transform)
-
-    #
-    # Drawing methods
-    #
-
-    @arrayify_args
     def line(
         self,
         start: ArrayType = [0.0, 0.0, 0.0],
         end: ArrayType = [1.0, 0.0, 0.0],
-        rgb: Union[None, ArrayType] = None,
-        alpha: float = 1.0,
-        linewidth: float = 1.0,
-    ) -> vtk.vtkActor:
+        rgb: Optional[ArrayType] = None,
+        width: float = 0.005,
+    ):
         """! Draw a line.
 
         @param start The start of the line.
         @param end The end of the line.
         @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param linewidth The width of the line.
-        @return The line actor.
+        @param width The width of the line (m).
+        @return The viser handle.
         """
-        start = start.toarray().flatten().tolist()
-        end = end.toarray().flatten().tolist()
+        points = np.stack([_vec(start), _vec(end)])[None]
+        return self.server.scene.add_line_segments(
+            self._name("line"), points, _color(rgb), thickness=width
+        )
 
-        points = vtk.vtkPoints()
-        points.InsertNextPoint(*start)
-        points.InsertNextPoint(*end)
-
-        line = vtk.vtkLine()
-        line.GetPointIds().SetId(0, 0)
-        line.GetPointIds().SetId(0, 1)
-
-        lines = vtk.vtkCellArray()
-        lines.InsertNextCell(line)
-
-        polydata = vtk.vtkPolyData()
-        polydata.SetPoints(points)
-        polydata.SetLines(lines)
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(polydata)
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        actor.GetProperty().SetLineWidth(linewidth)
-
-        self.set_rgba(actor, rgb, alpha)
-        self.actors.append(actor)
-
-        return actor
-
-    @arrayify_args
     def sphere(
         self,
         radius: float = 1.0,
         position: ArrayType = [0.0, 0.0, 0.0],
-        rgb: Union[None, ArrayType] = None,
+        rgb: Optional[ArrayType] = None,
         alpha: float = 1.0,
-        theta_resolution: int = 20,
-        phi_resolution: int = 20,
-    ) -> vtk.vtkActor:
+    ):
         """! Draw a sphere.
 
         @param radius The radius of the sphere.
         @param position The position of the sphere.
         @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param theta_resolution The number of points in the longitude direction.
-        @param phi_resolution The number of points in the latitude direction.
-        @return The sphere actor.
+        @param alpha Transparency in range [0, 1].
+        @return The viser handle.
         """
+        return self.server.scene.add_icosphere(
+            self._name("sphere"),
+            radius=float(radius),
+            color=_color(rgb),
+            opacity=_opacity(alpha),
+            position=_vec(position),
+        )
 
-        sphere = vtkSphereSource()
-        sphere.SetRadius(radius)
-        sphere.SetThetaResolution(theta_resolution)
-        sphere.SetPhiResolution(phi_resolution)
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(sphere.GetOutputPort())
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        self.set_translation(actor, position)
-        self.set_rgba(actor, rgb, alpha)
-        self.actors.append(actor)
-
-        return actor
-
-    @arrayify_args
     def sphere_traj(
         self,
         position_traj: ArrayType,
         radius: float = 1.0,
-        rgb: Union[None, ArrayType] = None,
-        theta_resolution: int = 20,
-        phi_resolution: int = 20,
-        alpha_spec: Union[None, Dict] = None,
-        animate=False,
-        duration=5.0,
-    ) -> List[vtk.vtkActor]:
-        """! Draw a sphere trajectory.
+        rgb: Optional[ArrayType] = None,
+        alpha_spec: Optional[Dict] = None,
+        animate: bool = False,
+        duration: float = 5.0,
+    ) -> list:
+        """! Draw a sphere at every position of a trajectory, or one moving sphere.
 
-        @param position_traj The position trajectory for the spheres.
+        @param position_traj The positions, as a 3 x n array.
         @param radius The radius of the spheres.
         @param rgb The Red-Green-Blue values in range [0, 1].
-        @param theta_resolution The number of points in the longitude direction.
-        @param phi_resolution The number of points in the latitude direction.
-        @param The alpha specification.
-        @return The sphere actors.
+        @param alpha_spec Transparency of the spheres, see _alphas (ignored when animated).
+        @param animate When True, one sphere moves through the positions in duration seconds (played by start()).
+        @param duration Duration of the animation (s).
+        @return The viser handles.
         """
+        traj = np.asarray(position_traj, dtype=float).reshape(3, -1)
+        n = traj.shape[1]
+        if not animate:
+            return [
+                self.sphere(radius, traj[:, i], rgb, alpha)
+                for i, alpha in enumerate(_alphas(alpha_spec, n))
+            ]
 
-        default_alpha_spec = {"style": "none"}
-        if alpha_spec is None:
-            alpha_spec = default_alpha_spec.copy()
+        handle = self.sphere(radius, traj[:, 0], rgb)
 
-        n = position_traj.shape[1]
+        def update(t):
+            handle.position = traj[:, self._frame(t, duration, n)]
 
-        if alpha_spec["style"] == "none":
-            alphas = [1.0] * n
-        elif alpha_spec["style"] == "A":
-            alpha_min = alpha_spec.get("alpha_min", 0.1)
-            alpha_max = alpha_spec.get("alpha_max", 1.0)
-            alphas = np.linspace(alpha_min, alpha_max, n).tolist()
-        elif alpha_spec["style"] == "B":
-            alpha_min = alpha_spec.get("alpha_min", 0.1)
-            alpha_max = alpha_spec.get("alpha_max", 1.0)
-            alphas = [alpha_min] * (n - 1) + [alpha_max]
-        elif alpha_spec["style"] == "C":
-            alpha_start = alpha_spec.get("alpha_start", 1.0)
-            alpha_mid = alpha_spec.get("alpha_mid", 0.1)
-            alpha_end = alpha_spec.get("alpha_end", 1.0)
-            alphas = [alpha_start] + [alpha_mid] * (n - 2) + [alpha_end]
-        elif alpha_spec["style"] == "const":
-            alphas = [alpha_spec.get("alpha", 1.0)] * n
+        self._animations.append((float(duration), update))
+        return [handle]
 
-        sphere_traj = []
-        if animate:
-            self.actors.stop_adding_actors()
-
-        actors = []
-        for i, alpha in enumerate(alphas):
-            sphere = self.sphere(
-                radius=radius,
-                position=position_traj[:, i],
-                rgb=rgb,
-                alpha=alpha,
-                theta_resolution=theta_resolution,
-                phi_resolution=phi_resolution,
-            )
-
-            if animate:
-                sphere_traj.append([sphere])
-
-            actors.append(sphere)
-
-        if animate:
-            self.animate_callbacks.append(
-                AnimationCallback(
-                    sphere_traj, duration.toarray().flatten()[0], self.iren, self.ren
-                )
-            )
-            self.actors.start_adding_actors()
-
-        return actors
-
-    @arrayify_args
     def box(
         self,
         scale: ArrayType = [1, 1, 1],
-        rgb: Union[None, ArrayType] = None,
+        rgb: Optional[ArrayType] = None,
         alpha: float = 1.0,
         position: ArrayType = [0.0, 0.0, 0.0],
         orientation: ArrayType = [0.0, 0.0, 0.0],
         euler_seq: str = "xyz",
         euler_degrees: bool = False,
-    ) -> vtk.vtkActor:
+    ):
         """! Draw a box.
 
-        @param scale The length, width, and height for the box [L, W, H].
+        @param scale The length, width, and height of the box [L, W, H].
         @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param position The position of the transformation.
-        @param orientation Orientation of the transformation, either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return The box actor.
+        @param alpha Transparency in range [0, 1].
+        @param position The position of the box center.
+        @param orientation Orientation, either a quaternion (x, y, z, w) or Euler angles.
+        @param euler_seq Sequence of axes for Euler angles (scipy convention, e.g. "xyz" extrinsic, "XYZ" intrinsic).
+        @param euler_degrees If True, the Euler angles are in degrees.
+        @return The viser handle.
         """
-
-        scale = scale.toarray().flatten().tolist()
-
-        cube = vtk.vtkCubeSource()
-        cube.SetBounds(
-            -0.5 * scale[0],
-            0.5 * scale[0],
-            -0.5 * scale[1],
-            0.5 * scale[1],
-            -0.5 * scale[2],
-            0.5 * scale[2],
+        return self.server.scene.add_box(
+            self._name("box"),
+            color=_color(rgb),
+            dimensions=_vec(scale),
+            opacity=_opacity(alpha),
+            wxyz=_wxyz(orientation, euler_seq, euler_degrees),
+            position=_vec(position),
         )
 
-        # Create a vtkPolyDataMapper
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(cube.GetOutputPort())
-
-        # Create a vtkActor
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        self.set_tf(actor, position, orientation, euler_seq, euler_degrees)
-        self.set_rgba(actor, rgb, alpha)
-        self.actors.append(actor)
-
-        return actor
-
-    @arrayify_args
     def cylinder(
         self,
         radius: float = 1.0,
         height: float = 1.0,
-        rgb: Union[None, ArrayType] = None,
+        rgb: Optional[ArrayType] = None,
         alpha: float = 1.0,
-        resolution: int = 20,
         position: ArrayType = [0.0, 0.0, 0.0],
         orientation: ArrayType = [0.0, 0.0, 0.0],
         euler_seq: str = "xyz",
         euler_degrees: bool = False,
-    ) -> vtk.vtkActor:
-        """! Draw a cylinder (with main axis along y-axis).
+    ):
+        """! Draw a cylinder with its axis along z (as in URDF).
 
         @param radius The cylinder radius.
         @param height The height of the cylinder.
         @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param resolution The number of facets used to define cylinder.
-        @param position The position of the object.
-        @param orientation Orientation of the object, either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return The cylinder actor.
+        @param alpha Transparency in range [0, 1].
+        @param position The position of the cylinder center.
+        @param orientation Orientation, either a quaternion (x, y, z, w) or Euler angles.
+        @param euler_seq Sequence of axes for Euler angles (scipy convention).
+        @param euler_degrees If True, the Euler angles are in degrees.
+        @return The viser handle.
         """
-        cylinder = vtkCylinderSource()
-        cylinder.SetRadius(radius)
-        cylinder.SetHeight(height)
-        cylinder.SetResolution(resolution)
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(cylinder.GetOutputPort())
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        self.set_tf(actor, position, orientation, euler_seq, euler_degrees)
-        self.set_rgba(actor, rgb, alpha)
-        self.actors.append(actor)
-
-        return actor
-
-    @arrayify_args
-    def cylinder_urdf(
-        self,
-        radius=1.0,
-        height=1.0,
-        rgb=None,
-        alpha=1.0,
-        resolution=20,
-        position=[0.0, 0.0, 0.0],
-        orientation=[0.0, 0.0, 0.0],
-        euler_seq="xyz",
-        euler_degrees=False,
-    ) -> vtk.vtkActor:
-        """! Draw a cylinder (with main axis along the z-axis, i.e. similar to URDF).
-
-        @param radius The cylinder radius.
-        @param height The height of the cylinder.
-        @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param resolution The number of facets used to define cylinder.
-        @param position The position of the object.
-        @param orientation Orientation of the object, either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return The cylinder actor.
-        """
-
-        cylinder = vtkCylinderSource()
-        cylinder.SetRadius(radius)
-        cylinder.SetHeight(height)
-        cylinder.SetResolution(resolution)
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(cylinder.GetOutputPort())
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        R = self.cvt_orientation_to_rotation_matrix(
-            orientation, euler_seq, euler_degrees
+        return self.server.scene.add_cylinder(
+            self._name("cylinder"),
+            radius=float(radius),
+            height=float(height),
+            color=_color(rgb),
+            opacity=_opacity(alpha),
+            wxyz=_wxyz(orientation, euler_seq, euler_degrees),
+            position=_vec(position),
         )
-        tf_0 = r2t(Rot.from_euler("x", 90, degrees=True).as_matrix())
-        tf_1 = rt2tr(R, position)
-        tf = tf_1 @ tf_0
 
-        self.set_transformation(actor, tf)
-        self.set_rgba(actor, rgb, alpha)
-        self.actors.append(actor)
+    def mesh(
+        self,
+        filename: str,
+        scale: Optional[ArrayType] = None,
+        rgb: Optional[ArrayType] = None,
+        alpha: float = 1.0,
+        texture_filename: Optional[str] = None,
+        position: ArrayType = [0.0, 0.0, 0.0],
+        orientation: ArrayType = [0.0, 0.0, 0.0],
+        euler_seq: str = "xyz",
+        euler_degrees: bool = False,
+    ):
+        """! Draw a mesh file (STL, OBJ, PLY, GLB, ...; anything trimesh reads).
 
-        return actor
+        @param filename The mesh file.
+        @param scale Scale applied to the mesh in the xyz directions.
+        @param rgb The Red-Green-Blue values in range [0, 1]; when None, the colors or texture of the file are kept.
+        @param alpha Transparency in range [0, 1] (used with rgb).
+        @param texture_filename An image to use as texture, for meshes with texture coordinates (e.g. an OBJ without its .mtl).
+        @param position The position of the mesh.
+        @param orientation Orientation, either a quaternion (x, y, z, w) or Euler angles.
+        @param euler_seq Sequence of axes for Euler angles (scipy convention).
+        @param euler_degrees If True, the Euler angles are in degrees.
+        @return The viser handle, or None when the file cannot be read.
+        """
+        mesh = self._load_mesh(filename, scale)
+        if mesh is None:
+            return None
+        pose = dict(
+            wxyz=_wxyz(orientation, euler_seq, euler_degrees), position=_vec(position)
+        )
+        if rgb is not None:
+            return self.server.scene.add_mesh_simple(
+                self._name("mesh"),
+                mesh.vertices,
+                mesh.faces,
+                color=_color(rgb),
+                opacity=_opacity(alpha),
+                **pose,
+            )
+        if texture_filename is not None:
+            from PIL import Image  # viser depends on pillow
 
-    @arrayify_args
+            mesh = mesh.copy()
+            mesh.visual = trimesh.visual.TextureVisuals(
+                uv=mesh.visual.uv, image=Image.open(texture_filename)
+            )
+        return self.server.scene.add_mesh_trimesh(self._name("mesh"), mesh, **pose)
+
     def text(
         self,
         msg: str = "Hello, world!",
         position: ArrayType = [0.0, 0.0, 0.0],
-        scale: ArrayType = [1.0, 1.0, 1.0],
-        rgb: Union[None, ArrayType] = None,
-        alpha: float = 1.0,
-    ) -> vtk.vtkFollower:
-        """! Draw text.
+    ):
+        """! Draw a text label (always facing the camera).
 
-        @param msg The text to draw.
-        @param position The position to draw the text in the global frame.
-        @param scale The size of the text.
-        @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @return The text actor.
+        @param msg The text.
+        @param position The position of the text in the global frame.
+        @return The viser handle.
         """
-        position = position.toarray().flatten().tolist()
-        scale = scale.toarray().flatten().tolist()
+        return self.server.scene.add_label(
+            self._name("text"), str(msg), position=_vec(position)
+        )
 
-        # Create a text source to generate the text
-        textSource = vtk.vtkTextSource()
-        textSource.SetText(msg)
-        textSource.Update()
-
-        # Create a mapper to map the text source to graphics primitives
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(textSource.GetOutputPort())
-
-        # Create a follower to position the text in 3D space
-        follower = vtk.vtkFollower()
-        follower.SetMapper(mapper)
-        follower.SetPosition(*position)
-        follower.SetScale(*scale)
-        follower.SetCamera(self.camera)
-
-        self.set_rgba(follower, rgb, alpha)
-
-        self.actors.append(follower)
-
-        return follower
-
-    @arrayify_args
     def link(
         self,
-        T: ArrayType = None,
+        T: Optional[ArrayType] = None,
         axis_scale: float = 0.1,
-        axis_linewidth: float = 1.0,
         center_radius: float = 0.01,
-        center_rgb: Union[None, ArrayType] = None,
-        center_alpha: float = 1.0,
-        center_theta_resolution: int = 20,
-        center_phi_resolution: int = 20,
-        axis_alpha: float = 1.0,
-    ) -> List[vtk.vtkActor]:
-        """! Draw a link.
+    ):
+        """! Draw a coordinate frame (x red, y green, z blue).
 
-        @param T Homogeneous transformation matrix.
+        @param T Homogeneous transformation matrix of the frame (default: identity).
         @param axis_scale The axis length.
-        @param axis_linewidth Width of the axis lines.
-        @param center_radius The radius of the central sphere.
-        @param center_rgb The Red-Green-Blue values in range [0, 1].
-        @param center_alpha Transparency of the centeral sphere in range [0, 1].
-        @param center_theta_resolution The number of points in the longitude direction.
-        @param center_phi_resolution The number of points in the latitude direction.
-        @param axis_alpha Transparency of the axes in range [0, 1].
-        @return The link actors.
+        @param center_radius The radius of the sphere at the origin.
+        @return The viser handle.
         """
-        if T is None:
-            T = I4()
-
-        p = transl(T)
-        x = T[:3, 0]
-        y = T[:3, 1]
-        z = T[:3, 2]
-
-        actors = []
-
-        actors.append(
-            self.line(
-                start=p,
-                end=p + axis_scale * x,
-                rgb=[1, 0, 0],
-                alpha=axis_alpha,
-                linewidth=axis_linewidth,
-            )
+        T = np.eye(4) if T is None else np.asarray(T, dtype=float)
+        return self.server.scene.add_frame(
+            self._name("frame"),
+            axes_length=float(axis_scale),
+            axes_radius=0.05 * float(axis_scale),
+            origin_radius=float(center_radius),
+            wxyz=_wxyz_from_matrix(T[:3, :3]),
+            position=T[:3, 3],
         )
 
-        actors.append(
-            self.line(
-                start=p,
-                end=p + axis_scale * y,
-                rgb=[0, 1, 0],
-                alpha=axis_alpha,
-                linewidth=axis_linewidth,
-            )
-        )
-
-        actors.append(
-            self.line(
-                start=p,
-                end=p + axis_scale * z,
-                rgb=[0, 0, 1],
-                alpha=axis_alpha,
-                linewidth=axis_linewidth,
-            )
-        )
-
-        actors.append(
-            self.sphere(
-                radius=center_radius,
-                position=p,
-                rgb=center_rgb,
-                alpha=center_alpha,
-                theta_resolution=center_theta_resolution,
-                phi_resolution=center_phi_resolution,
-            )
-        )
-
-        return actors
-
-    @arrayify_args
     def grid_floor(
         self,
         num_cells: int = 10,
-        rgb: Union[None, ArrayType] = None,
-        alpha: float = 1.0,
-        linewidth: float = 3.0,
-        inner_rgb: Union[None, ArrayType] = None,
-        inner_alpha: Union[None, float] = None,
-        inner_linewidth: float = 1.0,
         stride: float = 1.0,
+        rgb: Optional[ArrayType] = None,
         euler: ArrayType = [0, 0, 0],
         euler_seq: str = "xyz",
         euler_degrees: bool = True,
-    ) -> List[vtk.vtkActor]:
-        """! Draw a grid floor.
-
-        @param num_cells The number of cells for the grid floor.
-        @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param linewidth The line width for the grid.
-        @param inner_rgb The Red-Green-Blue values in range [0, 1] for the inner lines at half the stride length.
-        @param inner_alpha Transparency of the actor in range [0, 1] for the inner lines at half the stride length.
-        @param inner_linewidth The line width for the grid for the inner lines at half the stride length.
-        @param stride The length of each main grid cell.
-        @param euler The Euler angles that defines the orientation of the plane the grid is defined on.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return The grid actors.
-        """
-        num_cells = num_cells.toarray().flatten().astype(int)[0]
-        stride = stride.toarray().flatten()[0]
-
-        assert num_cells > 0, "num_cells must be a positive number!"
-        assert num_cells % 2 == 0, "num_cells must be even!"
-
-        actors = []
-
-        num_lines = num_cells + 1
-
-        tf_0 = rt2tr(
-            I3(),
-            [
-                -0.5 * float(num_cells) * stride,
-                -0.5 * float(num_cells) * stride,
-                0.0,
-            ],
-        )
-        tf_1 = r2t(
-            Rot.from_euler(
-                euler_seq, euler.toarray().flatten(), degrees=euler_degrees
-            ).as_matrix()
-        )
-        tf = tf_1 @ tf_0
-
-        offset = vtk.vtkTransform()
-        offset.SetMatrix(tf.toarray().flatten().tolist())
-
-        if inner_rgb is None:
-            inner_rgb = rgb
-
-        if inner_alpha is None:
-            inner_alpha = alpha
-
-        for i in range(num_cells):
-            actor = self.line(
-                start=[(float(i) + 0.5) * stride, 0, 0],
-                end=[(float(i) + 0.5) * stride, float(num_cells) * stride, 0],
-                linewidth=inner_linewidth,
-                alpha=inner_alpha,
-                rgb=inner_rgb,
-            )
-            actor.SetUserTransform(offset)
-            actors.append(actor)
-
-            actor = self.line(
-                start=[0, (float(i) + 0.5) * stride, 0],
-                end=[float(num_cells) * stride, (float(i) + 0.5) * stride, 0],
-                linewidth=inner_linewidth,
-                alpha=inner_alpha,
-                rgb=inner_rgb,
-            )
-            actor.SetUserTransform(offset)
-            actors.append(actor)
-
-        for i in range(num_lines):
-            actor = self.line(
-                start=[float(i) * stride, 0, 0],
-                end=[float(i) * stride, float(num_cells) * stride, 0],
-                rgb=rgb,
-                alpha=alpha,
-                linewidth=linewidth,
-            )
-            actor.SetUserTransform(offset)
-            actors.append(actor)
-
-            actor = self.line(
-                start=[0, float(i) * stride, 0],
-                end=[float(num_cells) * stride, float(i) * stride, 0],
-                rgb=rgb,
-                alpha=alpha,
-                linewidth=linewidth,
-            )
-            actor.SetUserTransform(offset)
-            actors.append(actor)
-
-        return actors
-
-    @arrayify_args
-    def obj(
-        self,
-        obj_filename: str,
-        png_texture_filename: str = None,
-        position: ArrayType = [0.0, 0.0, 0.0],
-        orientation: ArrayType = [0.0, 0.0, 0.0],
-        euler_seq: str = "xyz",
-        euler_degrees: bool = False,
     ):
-        """! Load .obj file.
+        """! Draw a square grid, centered at the origin, in the xy plane (rotated by euler).
 
-        @param obj_filename The filename for the .obj file.
-        @param png_texture_filename The texture filename.
-        @param position The position of the object.
-        @param orientation Orientation of the object, either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return The actor representing the .obj file.
+        @param num_cells The number of cells along each side.
+        @param stride The length of each cell (thin lines are drawn at half of it).
+        @param rgb The Red-Green-Blue values in range [0, 1] of the cell lines.
+        @param euler Euler angles of the orientation of the plane.
+        @param euler_seq Sequence of axes for the Euler angles (scipy convention).
+        @param euler_degrees If True, the Euler angles are in degrees (default).
+        @return The viser handle.
         """
+        size = int(num_cells) * float(stride)
+        color = _color(rgb, default=(0.55, 0.55, 0.55))
+        return self.server.scene.add_grid(
+            self._name("grid"),
+            width=size,
+            height=size,
+            cell_size=0.5 * float(stride),
+            cell_color=color,
+            section_size=float(stride),
+            section_color=color,
+            section_thickness=2.0,
+            wxyz=_wxyz(euler, euler_seq, euler_degrees),
+        )
 
-        # Read the .obj file
-        reader = vtk.vtkOBJReader()
-        reader.SetFileName(obj_filename)
-        reader.Update()
-
-        # Create a mapper and actor
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(reader.GetOutputPort())
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-
-        if isinstance(png_texture_filename, str):
-            # Create a texture from the png file
-            texture = vtk.vtkTexture()
-            texture_image = vtk.vtkPNGReader()
-            texture_image.SetFileName(png_texture_filename)
-            texture_image.Update()
-            texture.SetInputConnection(texture_image.GetOutputPort())
-
-            actor.SetTexture(texture)
-
-        self.set_tf(actor, position, orientation, euler_seq, euler_degrees)
-
-        self.actors.append(actor)
-
-        return actor
-
-    @arrayify_args
-    def stl(
-        self,
-        filename,
-        scale=None,
-        rgb=None,
-        alpha=1.0,
-        position=[0.0, 0.0, 0.0],
-        orientation=[0.0, 0.0, 0.0],
-        euler_seq="xyz",
-        euler_degrees=False,
-    ) -> vtk.vtkActor:
-        """! Load .stl file.
-
-        @param filename The filename for the .stl file.
-        @param scale Scale applied to the mesh file in the xyz directions.
-        @param rgb The Red-Green-Blue values in range [0, 1].
-        @param alpha Transparency of the actor in range [0, 1].
-        @param position The position of the object.
-        @param orientation Orientation of the object, either a quaternion or Euler angles.
-        @param euler_seq When orientation are Euler angles, specifies sequence of axes for rotations. Up to 3 characters belonging to the set {'X', 'Y', 'Z'} for intrinsic rotations, or {'x', 'y', 'z'} for extrinsic rotations. When orientation are Euler angles, extrinsic and intrinsic rotations cannot be mixed in one function call.
-        @param euler_degrees If True, then the given angles are assumed to be in degrees. Default is False.
-        @return The actor representing the .stl file.
-        """
-
-        reader = vtk.vtkSTLReader()
-        reader.SetFileName(filename)
-
-        if scale is None:
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(reader.GetOutputPort())
-
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-        else:
-            scale = scale.toarray().flatten().tolist()
-
-            transform = vtk.vtkTransform()
-            transform.Scale(*scale)
-
-            transformFilter = vtk.vtkTransformPolyDataFilter()
-            transformFilter.SetTransform(transform)
-            transformFilter.SetInputConnection(reader.GetOutputPort())
-
-            # Visualize the object
-            mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputConnection(transformFilter.GetOutputPort())
-
-            actor = vtk.vtkActor()
-            actor.SetMapper(mapper)
-
-        self.set_tf(actor, position, orientation, euler_seq, euler_degrees)
-        self.set_rgba(actor, rgb, alpha)
-        self.actors.append(actor)
-
-        return actor
+    #
+    # Robots
+    #
 
     def robot(
         self,
         robot_model: RobotModel,
-        q: ArrayType = None,
+        q: Optional[ArrayType] = None,
         alpha: float = 1.0,
         show_links: bool = False,
         link_axis_scale: float = 0.2,
-        link_axis_linewidth: float = 1.0,
-        link_center_radius: float = 0.01,
-        link_center_rgb: Union[None, ArrayType] = None,
-        link_center_alpha: Union[None, ArrayType] = None,
         display_link_names: bool = False,
-        link_names_scale: ArrayType = [0.005, 0.005, 0.005],
-        link_names_rgb: ArrayType = [1, 1, 1],
-        link_names_alpha: float = 1.0,
-    ) -> List[vtk.vtkActor]:
-        """! Draw a robot.
+    ) -> list:
+        """! Draw a robot from its URDF visuals (meshes, boxes, cylinders and spheres).
 
-        @param robot_model The robot model defining the robot kinematics and visuals.
-        @param q Joint configuration to draw robot.
-        @param alpha Transparency of the actor in range [0, 1].
-        @param show_links When true, the robot links are shown.
-        @param link_axis_scale The scale for the link axes when shown.
-        @param link_axis_linewidth The linewidth for the axes of the robot links when shown.
-        @param link_center_radius The radius of the axis central sphere when shown.
-        @param link_center_rgb The RGB values for the central sphere in range [0, 1] when shown.
-        @param link_center_alpha The transparency for the central sphere in the range [0, 1] when shown.
-        @param display_link_names When true, the names of the robot link are shown.
-        @param link_names_scale The size of the link names text when shown.
-        @param link_names_rgb The RGB values in range [0, 1] for the robot link names text when shown.
-        @param link_names_alpha The transparency in range [0, 1] for the robot link names when shown.
-        @return The actors representing the robot.
+        @param robot_model The robot model defining the kinematics and visuals.
+        @param q Joint configuration (default: zero).
+        @param alpha Transparency in range [0, 1].
+        @param show_links When True, the link frames are drawn.
+        @param link_axis_scale The axis length of the link frames.
+        @param display_link_names When True, the link names are drawn.
+        @return The viser handles; handles[i] is drawn by visual i, so they can be moved by _set_robot_pose.
         """
-        if link_center_alpha is None:
-            link_center_alpha = alpha
+        visuals = self._visuals(robot_model)
+        q = np.zeros(robot_model.ndof) if q is None else q
+        link_tfs = visuals.poses(q)
+        scene = self.server.scene
 
-        actors = []
-
-        urdf = robot_model.get_urdf()
-
-        material_names = [m.name for m in urdf.materials]
-
-        def get_material_rgba(name):
-            try:
-                idx = material_names.index(name)
-            except ValueError:
-                return None
-            material = urdf.materials[idx]
-            if material.color is not None:
-                return material.color.rgba
-
-        if q is None:
-            q_user_input = [0.0] * robot_model.ndof
-        else:
-            q_user_input = cs.vec(q)
-
-        # Setup functions to compute visual origins in global frame
-        q = cs.SX.sym("q", robot_model.ndof)
-        link_tf = {}
-        visual_tf = {}
-        for urdf_link in urdf.links:
-            name = urdf_link.name
-
-            lnk_tf = robot_model.get_global_link_transform(urdf_link.name, q)
-            link_tf[name] = cs.Function(f"link_tf_{name}", [q], [lnk_tf])
-
-            xyz, rpy = robot_model.get_link_visual_origin(urdf_link)
-            visl_tf = rt2tr(rpy2r(rpy), xyz)
-
-            tf = lnk_tf @ visl_tf
-            visual_tf[name] = cs.Function(f"visual_tf_{name}", [q], [tf])
-
-        for urdf_link in urdf.links:
-            tf = visual_tf[urdf_link.name](q_user_input).toarray()
-            position = tf[:3, 3].flatten().tolist()
-            orientation = Rot.from_matrix(tf[:3, :3]).as_quat().tolist()
-
-            if show_links:
-                actors += self.link(
-                    tf,
-                    axis_scale=link_axis_scale,
-                    axis_linewidth=link_axis_linewidth,
-                    center_radius=link_center_radius,
-                    center_rgb=link_center_rgb,
-                    center_alpha=link_center_alpha,
-                )
-
-            if display_link_names:
-                actors.append(
-                    self.text(
-                        msg=urdf_link.name,
-                        position=position,
-                        scale=link_names_scale,
-                        rgb=link_names_rgb,
-                        alpha=link_names_alpha,
-                    )
-                )
-
-            for visual in urdf_link.visuals:
-                if visual is None:
+        handles = []
+        for i, T_link, geometry, rgb in visuals.visuals:
+            T = link_tfs[i] @ T_link
+            pose = dict(wxyz=_wxyz_from_matrix(T[:3, :3]), position=T[:3, 3])
+            style = dict(color=_color(rgb), opacity=_opacity(alpha))
+            if isinstance(geometry, Mesh):
+                filename = geometry.filename
+                if not os.path.exists(filename):
+                    filename = os.path.join(visuals.dirname, filename)
+                mesh = self._load_mesh(filename, geometry.scale)
+                if mesh is None:
                     continue
+                handle = scene.add_mesh_simple(
+                    self._name("robot"), mesh.vertices, mesh.faces, **style, **pose
+                )
+            elif isinstance(geometry, Box):
+                handle = scene.add_box(
+                    self._name("robot"), dimensions=geometry.size, **style, **pose
+                )
+            elif isinstance(geometry, Cylinder):
+                handle = scene.add_cylinder(
+                    self._name("robot"),
+                    radius=geometry.radius,
+                    height=geometry.length,
+                    **style,
+                    **pose,
+                )
+            elif isinstance(geometry, Sphere):
+                handle = scene.add_icosphere(
+                    self._name("robot"), radius=geometry.radius, **style, **pose
+                )
+            else:
+                continue
+            handle._optas_link = (i, T_link)  # to move it with the robot
+            handles.append(handle)
 
-                geometry = visual.geometry
+        for i, name in enumerate(visuals.link_names):
+            if show_links:
+                handle = self.link(link_tfs[i], axis_scale=link_axis_scale)
+                handle._optas_link = (i, np.eye(4))
+                handles.append(handle)
+            if display_link_names:
+                handle = self.text(name, link_tfs[i][:3, 3])
+                handle._optas_link = (i, np.eye(4))
+                handles.append(handle)
 
-                xyz, rpy = cs.DM.zeros(3), cs.DM.zeros(3)
-                if visual.origin is not None:
-                    xyz, rpy = cs.DM(visual.origin.xyz), cs.DM(visual.origin.rpy)
+        return handles
 
-                T_vis = rt2tr(rpy2r(rpy), xyz).toarray()
-
-                T = tf @ T_vis
-                position = transl(T).toarray().flatten()
-                orientation = Rot.from_matrix(T[:3, :3]).as_quat().tolist()
-
-                material = visual.material
-                rgb = None
-                if isinstance(material.name, str) and material.name in material_names:
-                    rgba = get_material_rgba(visual.material.name)
-                    rgb = rgba[:3]
-
-                if isinstance(geometry, Mesh):
-                    if geometry.filename.lower().endswith(".stl"):
-                        filename = geometry.filename
-
-                        if not os.path.exists(filename):
-                            relpath = robot_model.get_urdf_dirname()
-                            filename = os.path.join(relpath, filename)
-
-                        scale = None
-                        if geometry.scale is not None:
-                            scale = geometry.scale
-
-                        actors.append(
-                            self.stl(
-                                filename,
-                                scale=scale,
-                                rgb=rgb,
-                                alpha=alpha,
-                                position=position,
-                                orientation=orientation,
-                                euler_seq="xyz",
-                                euler_degrees=True,
-                            )
-                        )
-
-                elif isinstance(geometry, Sphere):
-                    actors.append(
-                        self.sphere(
-                            radius=geometry.radius,
-                            position=position,
-                            rgb=rgb,
-                            alpha=alpha,
-                            theta_resolution=20,
-                            phi_resolution=20,
-                        )
-                    )
-
-                elif isinstance(geometry, Cylinder):
-                    actors.append(
-                        self.cylinder_urdf(
-                            radius=geometry.radius,
-                            height=geometry.length,
-                            position=position,
-                            orientation=orientation,
-                            rgb=rgb,
-                            alpha=alpha,
-                        )
-                    )
-
-        return actors
+    def _set_robot_pose(
+        self, robot_model: RobotModel, handles: list, q: ArrayType
+    ) -> None:
+        """! Move the handles returned by robot() to configuration q."""
+        link_tfs = self._visuals(robot_model).poses(q)
+        with self.server.atomic():
+            for handle in handles:
+                i, T_link = handle._optas_link
+                T = link_tfs[i] @ T_link
+                handle.wxyz = _wxyz_from_matrix(T[:3, :3])
+                handle.position = T[:3, 3]
 
     def robot_traj(
         self,
-        robot_model,
-        Q,
-        alpha_spec=None,
-        show_links=False,
-        link_axis_scale=0.2,
-        link_axis_linewidth=1.0,
-        link_center_rgb=1,
-        link_center_alpha=None,
-        link_center_radius=0.01,
-        display_link_names=False,
-        link_names_scale=[0.01, 0.01, 0.01],
-        link_names_rgb=[1, 1, 1],
-        link_names_alpha=1.0,
-        animate=False,
-        duration=5.0,
-    ):
-        """! Draw a robot through a trajectory.
+        robot_model: RobotModel,
+        Q: ArrayType,
+        alpha_spec: Optional[Dict] = None,
+        show_links: bool = False,
+        link_axis_scale: float = 0.2,
+        display_link_names: bool = False,
+        animate: bool = False,
+        duration: float = 5.0,
+    ) -> list:
+        """! Draw a robot at every configuration of a trajectory, or one moving robot.
 
-        @param robot_model The robot model defining the robot kinematics and visuals.
-        @param Q Joint configuration trajectory to draw robot.
-        @param alpha_spec Transparency specification of the robots in motion.
-        @param show_links When true, the robot links are shown.
-        @param link_axis_scale The scale for the link axes when shown.
-        @param link_axis_linewidth The linewidth for the axes of the robot links when shown.
-        @param link_center_radius The radius of the axis central sphere when shown.
-        @param link_center_rgb The RGB values for the central sphere in range [0, 1] when shown.
-        @param link_center_alpha The transparency for the central sphere in the range [0, 1] when shown.
-        @param display_link_names When true, the names of the robot link are shown.
-        @param link_names_scale The size of the link names text when shown.
-        @param link_names_rgb The RGB values in range [0, 1] for the robot link names text when shown.
-        @param link_names_alpha The transparency in range [0, 1] for the robot link names when shown.
-        @return The actors representing the robot.
+        @param robot_model The robot model defining the kinematics and visuals.
+        @param Q Joint configuration trajectory, as an ndof x n array.
+        @param alpha_spec Transparency of the robots, see _alphas (ignored when animated).
+        @param show_links When True, the link frames are drawn.
+        @param link_axis_scale The axis length of the link frames.
+        @param display_link_names When True, the link names are drawn.
+        @param animate When True, one robot moves through Q in duration seconds (played by start()).
+        @param duration Duration of the animation (s).
+        @return The viser handles.
         """
-        default_alpha_spec = {"style": "none"}
-        if alpha_spec is None:
-            alpha_spec = default_alpha_spec.copy()
-
-        actors = []
+        Q = np.asarray(Q, dtype=float).reshape(robot_model.ndof, -1)
         n = Q.shape[1]
+        options = dict(
+            show_links=show_links,
+            link_axis_scale=link_axis_scale,
+            display_link_names=display_link_names,
+        )
+        if not animate:
+            handles = []
+            for i, alpha in enumerate(_alphas(alpha_spec, n)):
+                handles += self.robot(robot_model, Q[:, i], alpha=alpha, **options)
+            return handles
 
-        if alpha_spec["style"] == "none":
-            alphas = np.ones(n).tolist()
-        elif alpha_spec["style"] == "A":
-            alpha_min = alpha_spec.get("alpha_min", 0.1)
-            alpha_max = alpha_spec.get("alpha_max", 1.0)
-            alphas = np.linspace(alpha_min, alpha_max, n).tolist()
-        elif alpha_spec["style"] == "B":
-            alpha_min = alpha_spec.get("alpha_min", 0.1)
-            alpha_max = alpha_spec.get("alpha_max", 1.0)
-            alphas = [alpha_min] * (n - 1) + [alpha_max]
-        elif alpha_spec["style"] == "C":
-            alpha_start = alpha_spec.get("alpha_start", 1.0)
-            alpha_mid = alpha_spec.get("alpha_mid", 0.1)
-            alpha_end = alpha_spec.get("alpha_end", 1.0)
-            alphas = [alpha_start] + [alpha_mid] * (n - 2) + [alpha_end]
+        handles = self.robot(robot_model, Q[:, 0], **options)
 
-        robot_traj = []
-        if animate:
-            self.actors.stop_adding_actors()
+        def update(t):
+            q = Q[:, self._frame(t, duration, n)]
+            self._set_robot_pose(robot_model, handles, q)
 
-        for i, alpha in enumerate(alphas):
-            robot = self.robot(
-                robot_model,
-                Q[:, i],
-                alpha,
-                show_links,
-                link_axis_scale,
-                link_axis_linewidth,
-                link_center_rgb,
-                link_center_alpha,
-                link_center_radius,
-                display_link_names,
-                link_names_scale,
-                link_names_rgb,
-                link_names_alpha,
-            )
+        self._animations.append((float(duration), update))
+        return handles
 
-            if animate:
-                robot_traj.append(robot)
+    #
+    # Running
+    #
 
-            actors += robot
+    @staticmethod
+    def _frame(t: float, duration: float, n: int) -> int:
+        """! Index of the trajectory element shown at time t (the last one after duration)."""
+        if n == 1 or duration <= 0.0:
+            return n - 1
+        return int(round(min(max(t / duration, 0.0), 1.0) * (n - 1)))
 
-        if animate:
-            self.animate_callbacks.append(
-                AnimationCallback(robot_traj, duration, self.iren, self.ren)
-            )
-            self.actors.start_adding_actors()
-
-        return actors
-
-    def save(self, file_name):
-        """! Save the visualizer window as png image. Note, saving animations is currently not supported."""
-        assert (
-            len(self.animate_callbacks) == 0
-        ), "saving animations is currently not supported"
-
-        if not file_name.endswith(".png"):
-            file_name += ".png"
-
-        for actor in self.actors.actors:
-            self.ren.AddActor(actor)
-        self.iren.Initialize()
-
-        self.renWin.Render()
-
-        # Capture the contents of the render window
-        window_to_image_filter = vtk.vtkWindowToImageFilter()
-        window_to_image_filter.SetInput(self.renWin)
-        window_to_image_filter.Update()
-
-        # Write the captured image to a PNG file
-        png_writer = vtk.vtkPNGWriter()
-        png_writer.SetFileName(file_name)
-        png_writer.SetInputConnection(window_to_image_filter.GetOutputPort())
-        png_writer.Write()
-        print(f"Saved {file_name}")
-
-        self.iren.Start()
+    def show_time(self, t: float) -> None:
+        """! Show every animation at time t (s)."""
+        for _, update in self._animations:
+            update(t)
 
     def start(self) -> None:
-        """! Start the visualizer."""
-        for actor in self.actors.actors:
-            self.ren.AddActor(actor)
-        self.iren.Initialize()
+        """! Keep the server running (and play the animations) until Ctrl+C, or for quit_after_delay seconds.
 
-        for callback in self.animate_callbacks:
-            callback.start()
+        Animations loop; the viser panel has a play/pause checkbox and a time slider.
+        """
+        print(f"Visualizer: open http://localhost:{self.server.get_port()}")
+        end = None
+        if self._quit_after_delay is not None:
+            end = time.time() + float(self._quit_after_delay)
 
-        self.renWin.Render()
-        self.iren.Start()
+        period = max([d for d, _ in self._animations], default=0.0)
+        if period > 0.0:
+            gui = self.server.gui
+            play = gui.add_checkbox("Play", initial_value=True)
+            slider = gui.add_slider(
+                "Time [s]", min=0.0, max=period, step=0.01, initial_value=0.0
+            )
 
-    def close(self, obj, event) -> None:
-        """! Close the visualizer."""
-        self.renWin.Finalize()
-        self.iren.TerminateApp()
+            @slider.on_update
+            def _(_):
+                if not play.value:
+                    self.show_time(slider.value)
+
+        try:
+            t0 = time.time()
+            while end is None or time.time() < end:
+                if period > 0.0 and play.value:
+                    t = (time.time() - t0) % period
+                    slider.value = t
+                    self.show_time(t)
+                elif period > 0.0:
+                    t0 = time.time() - slider.value  # resume from the slider
+                time.sleep(0.02)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.server.stop()
